@@ -11,6 +11,11 @@ REXCVAR_DECLARE(std::string, gpu_plugin);
 REXCVAR_DECLARE(bool, mnk_mode);
 #endif
 
+#if defined(__SWITCH__)
+#include <rex/cvar.h>
+REXCVAR_DECLARE(int32_t, audio_maxqframes);
+#endif
+
 class GhApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -20,7 +25,10 @@ class GhApp : public rex::ReXApp {
     return std::unique_ptr<GhApp>(new GhApp(ctx, "gh", PPCImageConfig));
   }
 
-#if !defined(__SWITCH__)
+#if defined(__SWITCH__)
+  // Short audio queue for the audout driver (src/nx_audout_driver.h): 8 frames x 5.33 ms.
+  void OnConfigurePaths(rex::PathConfig&) override { REXCVAR_SET(audio_maxqframes, 8); }
+#else
   void OnConfigurePaths(rex::PathConfig& paths) override {
     config_path_ = paths.config_path;
     // No --game_data_root: use the "game" folder next to the executable (default.xex + media/ inside).

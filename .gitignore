@@ -10,3 +10,4 @@ build/
 *.dksh
 __pycache__/
 mods/
+switch/logs/

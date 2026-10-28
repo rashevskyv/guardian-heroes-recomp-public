@@ -37,3 +37,8 @@ tar -C pkg -czf "gh-$V-linux-x86_64.tar.gz" "gh-$V-linux-x86_64"
 rm -rf pkg
 sha256sum gh-$V-* > SHA256SUMS
 ls -la; cat SHA256SUMS
+
+# Releases go ONLY to the public repo (the work repo stays private; never change a repo's visibility).
+# Publish after tools/export_public.sh --push, only when asked. Tag = build version, notes name the work commit:
+echo "gh release create v$V gh-$V-switch.zip gh-$V-linux-x86_64.tar.gz SHA256SUMS -R rashevskyv/guardian-heroes-recomp-public --title \"Guardian Heroes recompilation $V\" --notes \"Built from work commit ${V##*.}.\""
+# Windows: build with tools/win-msvc-build.cmd at the same commit, then `scripts/package-windows.sh $V` and add its zip to the release + SHA256SUMS.

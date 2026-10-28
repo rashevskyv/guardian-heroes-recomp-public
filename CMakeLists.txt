@@ -51,6 +51,8 @@ endif()
 set(REXGPU_XENOS_EXTRA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/trace_backend.cpp")
 if(NINTENDO_SWITCH)
     list(APPEND REXGPU_XENOS_EXTRA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/deko3d_backend.cpp")
+    # gh: sprite replacement store used by the deko3d backend (no GPU code, host-testable: tools/sprite_mod_test.py)
+    list(APPEND REXGPU_XENOS_EXTRA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sprite_mod.cpp")
 endif()
 
 include(generated/rexglue.cmake)

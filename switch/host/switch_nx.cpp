@@ -152,7 +152,12 @@ struct NxThread {
     Handle handle;
     char name[40];
     u64 last_ticks;
+    bool boosted;
 };
+// gh: a game thread (unnamed "XThread...", time-sliced at 0x3B) that keeps 20 percent of a core is moved above the other game
+// threads (0x2C, still below the GPU 0x28, vsync 0x27, audio worker 0x2A and audio output 0x29): the game's audio
+// engine thread starved behind its 0x3B peers and the sound crackled (Prototype 2 had the same lesson).
+bool nx_auto_boost = false;
 NxThread nx_threads[64];
 Mutex nx_threads_lock;
 
@@ -164,6 +169,7 @@ void register_thread(Thread* thread, const char* name) {
             t.handle = thread->handle;
             std::snprintf(t.name, sizeof(t.name), "%s", name);
             t.last_ticks = 0;
+            t.boosted = false;
             break;
         }
     }
@@ -191,6 +197,11 @@ void print_cpu_profile(u64 period_ticks) {
         const u64 delta = t.last_ticks ? ticks - t.last_ticks : 0;
         t.last_ticks = ticks;
         const unsigned pct = (unsigned)(delta * 100 / period_ticks);
+        if (nx_auto_boost && !t.boosted && pct >= 20 && std::strncmp(t.name, "XThread", 7) == 0) {
+            svcSetThreadPriority(t.handle, 0x2C);
+            t.boosted = true;
+            std::printf("[nx] thread \"%s\" kept %u%% of a core at 0x3B: priority 0x2C now\n", t.name, pct);
+        }
         if (pct >= 1 && n < (int)sizeof(line) - 48) {
             // Horizon time-slices only priority 0x3B (sa2-nx's notes): the priority matters.
             s32 prio = 0;
@@ -447,6 +458,7 @@ extern "C" void userAppInit(void) {
     envSetExitFuncPtr(end_process);
     register_thread(threadGetSelf(), "main");
     pinning = access("sdmc:/switch/gh/nopin", F_OK) != 0;
+    nx_auto_boost = pinning && access("sdmc:/switch/gh/noboost", F_OK) != 0;  // gh: noboost turns off only the thread boost
     std::printf("[nx] thread placement %s\n", pinning ? "on (sdmc:/switch/gh/nopin turns it off)" : "off (nopin)");
     // Is the guest arena's memory as fast as malloc memory? (membench_nx.cpp, ~1 s, once.)
     rex_nx_membench();
@@ -470,6 +482,7 @@ const Placement placements[] = {
     {"GPU VSync", 0x27, 2, 0x4},
     {"Audio Worker", 0x2A, 2, 0x4},
     {"XMA", 0x2B, 2, 0x4},
+    {"Audio Client", 0x2A, 1, 0x6},  // one per guest audio client: mostly waiting on the game's mixer thread
     {"XThread", 0x3B, 1, 0x6},  // the game's other threads, time-sliced on cores 1-2
 };
 

@@ -51,7 +51,7 @@ class Chara:
         if not w or not h:
             return np.zeros((h, w), np.uint8)
         o = tiled_offsets((w + 31) & ~31, (h + 31) & ~31, 0)[:h, :w]
-        return np.frombuffer(bytes(self.x[off:off + self.span(f)]), np.uint8)[o]
+        return np.frombuffer(bytes(self.x[off:off + self.span(f)]).ljust(self.span(f), b'\0'), np.uint8)[o]
 
     def set_idx(self, f, a):
         w, h, _, _, off = self.recs[f]

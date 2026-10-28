@@ -117,3 +117,91 @@ def win_processor(s):
 
 
 rw('CMakeLists.txt', win_processor)
+
+
+# Switch audio: the guest frames go to libnx audout (src/nx_audout_driver.h) instead of the silent driver.
+def nx_audio(s):
+    if 'gh-edits: audout' in s:
+        return s
+    anchor = '#include <rex/thread.h>' + NL
+    assert anchor in s, 'nop_audio_system.cpp include anchor'
+    s = s.replace(anchor, anchor + '#ifdef __SWITCH__  // gh-edits: audout' + NL +
+                  '#include "nx_audout_driver.h"' + NL + '#endif' + NL, 1)
+    old = '  *out_driver = new NopAudioDriver(memory(), semaphore);' + NL
+    assert old in s, 'nop CreateDriver'
+    return s.replace(old, '#ifdef __SWITCH__' + NL + '  *out_driver = new NxAudoutDriver(memory(), semaphore);' + NL +
+                     '#else' + NL + old + '#endif' + NL, 1)
+
+
+nop = os.path.join(SDK, 'src/audio/nop/nop_audio_system.cpp')
+if os.path.exists(nop):
+    import shutil
+    shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'nx_audout_driver.h'),
+                    os.path.join(SDK, 'src/audio/nop/nx_audout_driver.h'))
+    rw('src/audio/nop/nop_audio_system.cpp', nx_audio)
+
+
+# Older switch/sdk-edits.py runs left a block in AudioSystem::WorkerThreadMain that ends the worker at once on the
+# Switch ("no audio backend"): the guest then never gets its render-driver callbacks. Take it out (a no-op in a
+# fresh SDK copy).
+def keep_audio_worker(s):
+    marker = 'no audio backend, the audio worker leaves'
+    if marker not in s:
+        return s
+    start = s.rindex('#if REX_PLATFORM_SWITCH' + NL, 0, s.index(marker))
+    end = s.index('#endif' + NL, s.index(marker)) + len('#endif' + NL)
+    return s[:start] + s[end:]
+
+
+if os.path.exists(os.path.join(SDK, 'src/audio/audio_system.cpp')):
+    rw('src/audio/audio_system.cpp', keep_audio_worker)
+
+
+# Switch audio diagnostics: time the guest callback per client in the audio worker (printed every 5 s).
+def worker_timing(s):
+    if 'gh-edits: callback timing' in s:
+        return s
+    old = '        function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,' + NL +           '                                      rex::countof(args));' + NL
+    assert old in s, 'audio_system.cpp Execute anchor'
+    new = '        auto gh_t0 = std::chrono::steady_clock::now();  // gh-edits: callback timing' + NL + old +           '        {' + NL +           '          static uint64_t calls[8], total_us[8], max_us[8], over5[8];' + NL +           '          static auto last_print = gh_t0;' + NL +           '          const uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - gh_t0).count();' + NL +           '          const size_t ci = index < 8 ? index : 7;' + NL +           '          ++calls[ci]; total_us[ci] += us; if (us > max_us[ci]) max_us[ci] = us; if (us > 5000) ++over5[ci];' + NL +           '          if (std::chrono::steady_clock::now() - last_print > std::chrono::seconds(5)) {' + NL +           '            last_print = std::chrono::steady_clock::now();' + NL +           '            for (size_t k = 0; k < 8; ++k) if (calls[k]) {' + NL +           '              std::printf("[nx] audio worker: client %zu callbacks %llu, mean %llu us, max %llu us, %llu over 5 ms\\n", k, (unsigned long long)calls[k], (unsigned long long)(total_us[k] / calls[k]), (unsigned long long)max_us[k], (unsigned long long)over5[k]);' + NL +           '              calls[k] = total_us[k] = max_us[k] = over5[k] = 0;' + NL +           '            }' + NL +           '            std::fflush(stdout);' + NL +           '          }' + NL +           '        }' + NL
+    s = s.replace(old, new, 1)
+    if '#include <chrono>' not in s:
+        s = s.replace('#include <rex/audio/audio_system.h>' + NL, '#include <rex/audio/audio_system.h>' + NL + '#include <chrono>' + NL + '#include <cstdio>' + NL, 1)
+    return s
+
+
+if os.path.exists(os.path.join(SDK, 'src/audio/audio_system.cpp')):
+    rw('src/audio/audio_system.cpp', worker_timing)
+
+
+# Switch audio: one host thread per client (patches/audio_client_threads.inc) instead of the single audio worker
+# running every guest callback in turn; the worker itself only waits for the shutdown event.
+def client_threads(s):
+    if 'gh-edits: client threads' in s:
+        return s
+    inc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audio_client_threads.inc'), encoding='utf-8').read()
+
+    def once(src, anchor, text, after=True):
+        assert anchor in src, 'audio_system.cpp anchor: ' + anchor[:40]
+        return src.replace(anchor, anchor + text if after else text + anchor, 1)
+
+    s = once(s, 'namespace rex::audio {' + NL,
+             '#if REX_PLATFORM_SWITCH' + NL + 'static system::KernelState* gh_kernel_state = nullptr;' + NL +
+             'static uint32_t gh_client_gen[8];' + NL + '#endif' + NL)
+    s = once(s, 'X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {' + NL,
+             '#if REX_PLATFORM_SWITCH' + NL + '  gh_kernel_state = kernel_state;' + NL + '#endif' + NL)
+    s = once(s, '  clients_[index] = {driver, callback, callback_arg, ptr, true};' + NL, inc)
+    s = once(s, '  clients_[index] = {nullptr, 0, 0, 0, false};' + NL,
+             '#if REX_PLATFORM_SWITCH' + NL + '  ++gh_client_gen[index];' + NL + '#endif' + NL)
+    s = once(s, '  while (worker_running_) {' + NL,
+             '#if REX_PLATFORM_SWITCH  // gh-edits: the clients have their own threads' + NL +
+             '    rex::thread::Wait(shutdown_event_.get(), true, std::chrono::milliseconds(500));' + NL +
+             '    continue;' + NL + '#endif' + NL)
+    for inc_line in ('#include <chrono>', '#include <memory>', '#include <string>'):
+        if inc_line not in s:
+            s = s.replace('#include <rex/audio/audio_system.h>' + NL, '#include <rex/audio/audio_system.h>' + NL + inc_line + NL, 1)
+    return s
+
+
+if os.path.exists(os.path.join(SDK, 'src/audio/audio_system.cpp')):
+    rw('src/audio/audio_system.cpp', client_threads)

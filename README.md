@@ -12,14 +12,10 @@ recompiled program and the renderer. They do not hold the game's graphics, sound
 | --- | --- | --- |
 | Nintendo Switch | deko3d | Story mode plays at 60 fps on hardware. **No sound yet.** |
 | Linux x86-64 | Vulkan | Plays. Keyboard and gamepad. In-game settings window. Sound uses SDL audio (not yet checked by ear). |
-| Windows x86-64 | Vulkan | **No release file yet.** The MSYS2/MinGW build reaches the final link, then fails (see below). |
+| Windows x86-64 | Vulkan | Plays (title and story checked, keyboard works). Build: MSVC headers and libraries with clang. Gamepad not yet checked on Windows. |
 
 Known gaps: Xbox Live features, the avatar items, and the camera are not supported. There is no texture replacement yet
 (see `docs/PC-FEATURES.md` for the plan).
-
-Windows: the MinGW linker does not export the SDK's `__imp_*` kernel symbols from `librexruntime.dll`, and the program needs
-`-municode`. A clang-cl (MSVC) build is the likely way. `tools/win-configure.sh` and the edits in `patches/sdk-edits-gh.py`
-show how far the MinGW attempt went (the Vulkan renderer only, D3D12 off).
 
 ## Get your game files
 
@@ -63,6 +59,14 @@ Press **F1**, **Esc**, or **Start and Back together** on a gamepad to open the s
 while the window is open. You can change the display, the sound and the keys there. The window saves to `gh.toml`.
 The option `menu_open = start_back | hold_back | esc` selects how the gamepad opens it.
 
+## Windows
+
+1. Unzip `gh-<version>-windows-x86_64.zip`. It holds the program, the Microsoft runtime DLLs (no install needed) and `gh.bat`.
+2. Put your `game/` folder next to `gh.exe`, or pass `--game_data_root=<folder>`.
+3. Run `gh.bat` (or `gh.exe`). You need a Vulkan driver (every current graphics driver has one).
+
+The keys, the settings window and `gh.toml` work as on Linux.
+
 ## Build it yourself
 
 The build uses the ReXGlue SDK v0.10.0 plus small edits. Order of work:
@@ -70,10 +74,10 @@ The build uses the ReXGlue SDK v0.10.0 plus small edits. Order of work:
 1. Install the SDK and the CLI. Apply `patches/sdk/*` and run `switch/sdk-edits.py <sdk>` and `patches/sdk-edits-gh.py <sdk>`.
 2. Make the code: `rexglue codegen gh_manifest.toml` (needs `game/default.xex`). The output goes to `generated/default/`
    and is **not** part of this repository.
-3. Linux: `tools/wsl-linux.sh` (WSL or Linux, clang 20). Windows: `tools/win-configure.sh` (MSYS2 UCRT64, clang).
+3. Linux: `tools/wsl-linux.sh` (WSL or Linux, clang 20). Windows: `tools/win-msvc-build.cmd` (VS 2022 Build Tools for the headers and libraries, clang with the MSVC target; Vulkan only).
    Switch: `switch/build.sh` (devkitPro with devkitA64, deko3d, uam).
 
-`docs/` holds the design notes.
+`docs/` holds design notes.
 
 ## Legal
 

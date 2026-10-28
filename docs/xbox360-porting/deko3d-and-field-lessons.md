@@ -53,8 +53,7 @@ Guardian Heroes: a k_4_4_4_4 2048x2225 atlas with 24x26 cells. Later step: redra
   Codegen reuses old output when its stamp matches: use `--ignore-stamp`. In Guardian Heroes only cr/ctr/xer/reserved as local were safe;
   `non_argument` and `non_volatile` caused heap corruption. Measure, then keep what works.
 - Exit: `__nx_applet_exit_mode = 1`, then `__libnx_exit`. Version: NACP `0.<commit count>.<sha7>`, also in the log and on screen.
-- Sound: the SDK's nop audio backend consumes frames at 5.33 ms. A real Switch audio driver (libnx audout or audren) is REQUIRED for a releasable port.
-  On Linux the SDL audio backend works. At the time of writing sound was not solved in any of the three ports.
+- Sound (solved in Guardian Heroes 0.72): a real Switch driver on libnx audout (48 kHz stereo s16, one output thread mixing all guest clients, 2 buffers of 1024 samples, semaphore released when a frame goes into a buffer; `src/nx_audout_driver.h` in gh-recomp). The SDK audio worker runs the guest callback of every client in turn on ONE thread; the callbacks mostly wait on the game's mixer thread (1.5-4 ms each), so 3 clients saturate it and the last client starves (stutter with a healthy device). Fix: one host thread per client (`patches/audio_client_threads.inc`, `patches/sdk-edits-gh.py`), placed at priority 0x2A on cores 1-2. A bigger queue does not help (throughput, not jitter). Diagnose with per-client counters: empty pops, queue minimum, release-to-submit histogram, time per callback; the total underrun counter hides one late client. Eden shows the same pattern as the console. Details: gh-recomp `docs/SWITCH-AUDIO.md`.
 
 ## 4. Workflow that worked
 - Gates in order: Linux with the null GPU, then an Eden null-GPU run (swaps grow, clean exit; marker file `nogpu`), then Eden WITH a picture (deko3d), then the console.

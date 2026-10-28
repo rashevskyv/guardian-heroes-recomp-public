@@ -1,6 +1,6 @@
 # Projects catalog and honest checked / not checked list
 
-Date of research: 2026-10-22. Clones live in `C:\Users\Administrator\AppData\Local\Temp\x360\` (temp; re-clone with `gh repo clone <repo> -- --depth 1` into a SHORT path).
+Date of research: 2026-10-22. Clones lived in a temp folder with a short path (re-clone with `gh repo clone <repo> -- --depth 1` into a SHORT path).
 "Read code" = I (or a delegated reader) opened source files. "README only" = README or docs only. "Search only" = a search snippet or listing.
 I did not build or run any of these. Licences matter: GPL-3.0 repos give ideas, not files.
 

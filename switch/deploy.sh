@@ -22,6 +22,7 @@ VERSION=$(grep -o 'GH_VERSION "[^"]*"' "$BUILD/gh_version.h" | cut -d'"' -f2)
 case "$ACTION" in
     push)
         python3 tools/nro_nacp.py "$NRO" "$VERSION"
+        mkdir -p switch/logs/elf/$VERSION && cp "$BUILD/gh.elf" switch/logs/elf/$VERSION/gh.elf  # keeps the symbols of every pushed build (console pc samples)
         local_sha=$(sha1sum "$NRO" | cut -c1-40)
         # lftp reconnects and resumes (the console's FTP resets long transfers now and then).
         LFTP="set net:max-retries 8; set net:reconnect-interval-base 3; set net:timeout 25"

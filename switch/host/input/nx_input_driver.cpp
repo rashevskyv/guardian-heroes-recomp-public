@@ -12,13 +12,14 @@ extern "C" {
 volatile int rex_nx_menu_open = 0;    // 1 while the menu is up: the game sees a neutral pad
 volatile int rex_nx_menu_cursor = 0;  // 0 resume, 1 fps counter
 volatile int rex_nx_show_fps = 1;     // the fps number in the on-screen strip (the version always shows)
+volatile int rex_nx_sound = 1;       // the audio output (audout driver, src/nx_audout_driver.h) plays; 0 = silence
 }
 
 namespace rex::input::nx {
 
 namespace {
 
-constexpr int kMenuItems = 2;
+constexpr int kMenuItems = 3;
 bool g_combo_prev = false;
 bool g_neutral = false;  // neutral pad for the game until every button is released
 uint16_t g_prev_all = 0;
@@ -200,7 +201,8 @@ X_RESULT NXInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
         if (pressed & X_INPUT_GAMEPAD_DPAD_DOWN) rex_nx_menu_cursor = (rex_nx_menu_cursor + 1) % kMenuItems;
         if (pressed & X_INPUT_GAMEPAD_B) {  // the Switch A button (right) confirms
           if (rex_nx_menu_cursor == 0) rex_nx_menu_open = 0;
-          else rex_nx_show_fps = !rex_nx_show_fps;
+          else if (rex_nx_menu_cursor == 1) rex_nx_show_fps = !rex_nx_show_fps;
+          else rex_nx_sound = !rex_nx_sound;
         }
         if (pressed & X_INPUT_GAMEPAD_A) rex_nx_menu_open = 0;  // the Switch B button (bottom) goes back
         g_neutral = true;
