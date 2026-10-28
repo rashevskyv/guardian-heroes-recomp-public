@@ -10,12 +10,12 @@ recompiled program and the renderer. They do not hold the game's graphics, sound
 
 | Platform | Renderer | State |
 | --- | --- | --- |
-| Nintendo Switch | deko3d | Story mode plays at 60 fps on hardware. **No sound yet.** |
+| Nintendo Switch | deko3d | Plays at 60 fps on hardware, with sound (libnx audout). Both graphics modes (Remix and Original) work. |
 | Linux x86-64 | Vulkan | Plays. Keyboard and gamepad. In-game settings window. Sound uses SDL audio (not yet checked by ear). |
 | Windows x86-64 | Vulkan | Plays (title and story checked, keyboard works). Build: MSVC headers and libraries with clang. Gamepad not yet checked on Windows. |
 
-Known gaps: Xbox Live features, the avatar items, and the camera are not supported. There is no texture replacement yet
-(see `docs/PC-FEATURES.md` for the plan).
+Known gaps: Xbox Live features, the avatar items, and the camera are not supported. Sprite replacement (mods) works on Switch only
+(see "Sprite mods" below). Switch applet mode (launch from the album) is not tested.
 
 ## Get your game files
 
@@ -39,12 +39,20 @@ Buttons follow the Xbox layout by position (Switch B = Xbox A). The on-screen bu
 
 | Switch | Action |
 | --- | --- |
-| **+** and **−** together | Open the small settings menu: resume, fps counter on or off |
+| **+** and **−** together | Open the small settings menu: resume, fps counter on or off, sound on or off |
 | **+** | Start |
 | **−** | Back (skips cut scenes) |
 
 The version `0.<count>.<sha>` shows at the bottom-left of the screen and in the app list. Logs are in
 `sdmc:/switch/gh/gh_log.txt` and `gh_rex_log.txt`. Create an empty file `sdmc:/switch/gh/overlay_off` to hide the strip.
+
+Create an empty file `sdmc:/switch/gh/mute` to start with the sound off.
+
+### Sprite mods (Switch)
+
+Put PNG files in `sdmc:/switch/gh/mods/sprites/` to replace the character sprites of the Remix mode. The file name ends with
+`__<id>.png`; the id comes from `tools/spritemod.py export-all` (it reads your own game files). An indexed PNG that keeps the
+game's palette also keeps the costume colours. Tools: `tools/spritemod.py`, `tools/palettize.py`.
 
 ## Linux
 
