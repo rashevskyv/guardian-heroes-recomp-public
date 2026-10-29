@@ -11,3 +11,4 @@ build/
 __pycache__/
 mods/
 switch/logs/
+switch/icon/

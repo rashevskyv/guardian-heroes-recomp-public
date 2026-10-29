@@ -108,5 +108,10 @@ if(NINTENDO_SWITCH)
     # nx_create_nro takes no NAME/AUTHOR/VERSION (it silently made a default NACP: "gh",
     # "Unspecified Author", 1.0.0 until 0.55): the NACP is generated here and handed to it.
     nx_generate_nacp(gh.nacp NAME "Guardian Heroes" AUTHOR "gh-recomp" VERSION "${GH_VERSION}")
-    nx_create_nro(gh NACP gh.nacp)
+    # The icon is the game's art: it stays local (git-ignored); without it the default icon is used.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/switch/icon/gh_icon.jpg")
+        nx_create_nro(gh NACP gh.nacp ICON "${CMAKE_SOURCE_DIR}/switch/icon/gh_icon.jpg")
+    else()
+        nx_create_nro(gh NACP gh.nacp)
+    endif()
 endif()
