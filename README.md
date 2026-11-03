@@ -39,12 +39,12 @@ Buttons follow the Xbox layout by position (Switch B = Xbox A). The on-screen bu
 
 | Switch | Action |
 | --- | --- |
-| **+** and **−** together | Open the small settings menu: resume, fps counter on or off, sound on or off |
+| **+** and **−** together | Open the small settings menu: resume, fps counter, sound, overlay (each on or off, saved in `sdmc:/switch/gh/settings.txt`) |
 | **+** | Start |
 | **−** | Back (skips cut scenes) |
 
 The version `0.<count>.<sha>` shows at the bottom-left of the screen and in the app list. Logs are in
-`sdmc:/switch/gh/gh_log.txt` and `gh_rex_log.txt`. Create an empty file `sdmc:/switch/gh/overlay_off` to hide the strip.
+`sdmc:/switch/gh/gh_log.txt` and `gh_rex_log.txt`. The menu item "overlay" hides the strip; an empty file `sdmc:/switch/gh/overlay_off` does the same.
 
 Create an empty file `sdmc:/switch/gh/mute` to start with the sound off.
 
@@ -52,7 +52,7 @@ Create an empty file `sdmc:/switch/gh/mute` to start with the sound off.
 
 Put PNG files in `sdmc:/switch/gh/mods/sprites/` to replace the character sprites of the Remix mode. The file name ends with
 `__<id>.png`; the id comes from `tools/spritemod.py export-all` (it reads your own game files). An indexed PNG that keeps the
-game's palette also keeps the costume colours. Tools: `tools/spritemod.py`, `tools/palettize.py`.
+game's palette also keeps the costume colours. Tools: `tools/spritemod.py`, `tools/palettize.py`. Step by step: [docs/SPRITE-REPLACEMENT.md](docs/SPRITE-REPLACEMENT.md).
 
 ## Linux
 

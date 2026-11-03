@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 #include <rex/input/flags.h>
 #include <rex/logging.h>
@@ -10,16 +11,49 @@
 // gh: the settings menu drawn by the deko3d backend (src/gpu/deko3d_backend.cpp) reads these.
 extern "C" {
 volatile int rex_nx_menu_open = 0;    // 1 while the menu is up: the game sees a neutral pad
-volatile int rex_nx_menu_cursor = 0;  // 0 resume, 1 fps counter
-volatile int rex_nx_show_fps = 1;     // the fps number in the on-screen strip (the version always shows)
+volatile int rex_nx_menu_cursor = 0;  // 0 resume, 1 fps counter, 2 sound, 3 overlay
+volatile int rex_nx_show_fps = 1;     // the fps number in the on-screen strip
 volatile int rex_nx_sound = 1;       // the audio output (audout driver, src/nx_audout_driver.h) plays; 0 = silence
+volatile int rex_nx_overlay = 1;     // the on-screen strip (version + fps) is drawn; 0 = hidden
+
+// The three settings live in sdmc:/switch/gh/settings.txt ("fps=1", "sound=1", "overlay=1", one per line). The
+// file is read once, by whoever asks first (the pad driver or the deko3d backend), and written on every change
+// in the menu. The marker files overlay_off and mute (src/nx_audout_driver.h) still force a start with that
+// setting off.
+static const char* const kSettingsPath = "sdmc:/switch/gh/settings.txt";
+static bool g_settings_loaded = false;
+
+void rex_nx_load_settings(void) {
+  if (g_settings_loaded) return;
+  g_settings_loaded = true;
+  if (FILE* fp = std::fopen(kSettingsPath, "r")) {
+    char line[64];
+    while (std::fgets(line, sizeof(line), fp)) {
+      int v = 0;
+      if (std::sscanf(line, "fps=%d", &v) == 1) rex_nx_show_fps = v != 0;
+      else if (std::sscanf(line, "sound=%d", &v) == 1) rex_nx_sound = v != 0;
+      else if (std::sscanf(line, "overlay=%d", &v) == 1) rex_nx_overlay = v != 0;
+    }
+    std::fclose(fp);
+  }
+  if (access("sdmc:/switch/gh/overlay_off", F_OK) == 0) rex_nx_overlay = 0;
+  std::printf("[nx] settings: fps %d, sound %d, overlay %d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay);
+  std::fflush(stdout);
+}
+
+void rex_nx_save_settings(void) {
+  FILE* fp = std::fopen(kSettingsPath, "w");
+  if (!fp) return;
+  std::fprintf(fp, "fps=%d\nsound=%d\noverlay=%d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay);
+  std::fclose(fp);
+}
 }
 
 namespace rex::input::nx {
 
 namespace {
 
-constexpr int kMenuItems = 3;
+constexpr int kMenuItems = 4;
 bool g_combo_prev = false;
 bool g_neutral = false;  // neutral pad for the game until every button is released
 uint16_t g_prev_all = 0;
@@ -65,6 +99,7 @@ X_STATUS NXInputDriver::Setup() {
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&pad_);
   REXLOG_INFO("[nx] input: libnx pad (handheld / Joy-Con pair / Pro Controller) as gamepad 0");
+  rex_nx_load_settings();
   return X_STATUS_SUCCESS;
 }
 
@@ -193,6 +228,8 @@ X_RESULT NXInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
         rex_nx_menu_open = !rex_nx_menu_open;
         rex_nx_menu_cursor = 0;
         g_neutral = true;
+        std::printf("[nx] menu: %s (start+back)\n", rex_nx_menu_open ? "open" : "closed");
+        std::fflush(stdout);
       }
       g_combo_prev = combo;
       if (rex_nx_menu_open) {
@@ -202,7 +239,12 @@ X_RESULT NXInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
         if (pressed & X_INPUT_GAMEPAD_B) {  // the Switch A button (right) confirms
           if (rex_nx_menu_cursor == 0) rex_nx_menu_open = 0;
           else if (rex_nx_menu_cursor == 1) rex_nx_show_fps = !rex_nx_show_fps;
-          else rex_nx_sound = !rex_nx_sound;
+          else if (rex_nx_menu_cursor == 2) rex_nx_sound = !rex_nx_sound;
+          else rex_nx_overlay = !rex_nx_overlay;
+          if (rex_nx_menu_cursor) rex_nx_save_settings();
+          std::printf("[nx] menu: item %d confirmed: fps %d, sound %d, overlay %d\n", rex_nx_menu_cursor, rex_nx_show_fps,
+                      rex_nx_sound, rex_nx_overlay);
+          std::fflush(stdout);
         }
         if (pressed & X_INPUT_GAMEPAD_A) rex_nx_menu_open = 0;  // the Switch B button (bottom) goes back
         g_neutral = true;

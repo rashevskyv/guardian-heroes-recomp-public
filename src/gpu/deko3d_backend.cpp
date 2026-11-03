@@ -487,16 +487,19 @@ static bool DecodeStaged(const char* fmt, const uint8_t* s, uint32_t w, uint32_t
 // ----- on-screen version / fps strip (gh) ---------------------------------------------------------
 // Rule: every build shows its version on screen. There is no ImGui under deko3d, so the strip is a
 // 5x7 bitmap font rendered on the CPU into a small RGBA image per frame in flight and drawn with the
-// present shaders into a viewport at the bottom-left corner. The file sdmc:/switch/gh/overlay_off hides it.
+// present shaders into a viewport at the bottom-left corner. The menu item "overlay" (saved in settings.txt) or the
+// file sdmc:/switch/gh/overlay_off hides it.
 extern "C" const char* rex_nx_version(void);
 
 constexpr uint32_t kOverlayW = 512, kOverlayH = 20, kOverlayScale = 2;
-// The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x88 panel, 4 lines.
-constexpr uint32_t kMenuW = 256, kMenuH = 110;
+// The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x130 panel, 5 lines.
+constexpr uint32_t kMenuW = 256, kMenuH = 130;
 extern "C" volatile int rex_nx_menu_open;
 extern "C" volatile int rex_nx_menu_cursor;
 extern "C" volatile int rex_nx_show_fps;
 extern "C" volatile int rex_nx_sound;
+extern "C" volatile int rex_nx_overlay;
+extern "C" void rex_nx_load_settings(void);
 
 struct Glyph {
   char ch;
@@ -657,7 +660,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       sprite_mod_on_ = n > 0;
       Log("sprite mod: %zu replacement file(s) in %smods/sprites/", n, debug_dir.c_str());
     }
-    overlay_on_ = access((debug_dir + "overlay_off").c_str(), F_OK) != 0;  // gh: version + fps on screen
+    rex_nx_load_settings();  // gh: rex_nx_overlay (version + fps on screen), settings.txt or the overlay_off marker
     present_vs_ = LoadDksh(shader_dir_ + "present.vert.dksh", present_vs_shader_);
     present_fs_ = LoadDksh(shader_dir_ + "present.frag.dksh", present_fs_shader_);
     Log("deko3d backend up: shaders from %s (%s present shaders), %u MB images, %u MB data per frame",
@@ -1022,7 +1025,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     // gh overlay: the version and the fps, uploaded into this frame's image before the present pass.
     HostImage* overlay = nullptr;
-    if (overlay_on_) {
+    if (rex_nx_overlay) {
       const uint64_t now = armGetSystemTick();
       if (!fps_tick_) fps_tick_ = now;
       fps_frames_++;
@@ -1074,7 +1077,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
         DrawText(menu_px_.data(), kMenuW, 12, 46, line);
         std::snprintf(line, sizeof(line), "%ssound: %s", cur == 2 ? "> " : "  ", rex_nx_sound ? "on" : "off");
         DrawText(menu_px_.data(), kMenuW, 12, 66, line);
-        DrawText(menu_px_.data(), kMenuW, 12, 90, "a ok   b back");
+        std::snprintf(line, sizeof(line), "%soverlay: %s", cur == 3 ? "> " : "  ", rex_nx_overlay ? "on" : "off");
+        DrawText(menu_px_.data(), kMenuW, 12, 86, line);
+        DrawText(menu_px_.data(), kMenuW, 12, 110, "a ok   b back");
         const uint32_t bytes = kMenuW * kMenuH * 4;
         const uint32_t off = f.staging.Alloc(bytes, 0x100);
         if (off != UINT32_MAX) {
@@ -1867,7 +1872,6 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::unordered_set<uint64_t> dumped_tex_;
   std::vector<uint8_t> atlas_top_;  // gh: rows 0..74 of the UI font atlas as staged (little-endian u16), unswapped
   HostImage* overlay_[kFrames] = {};  // gh: the version / fps strip, one image per frame in flight
-  bool overlay_on_ = true;
   HostImage* menu_img_[kFrames] = {};  // gh: the settings menu panel
   std::vector<uint32_t> menu_px_ = std::vector<uint32_t>(kMenuW * kMenuH);
   char overlay_text_[64] = {};

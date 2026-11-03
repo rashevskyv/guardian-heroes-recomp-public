@@ -1,5 +1,5 @@
 diff --git b/src/gpu/deko3d_backend.cpp a/src/gpu/deko3d_backend.cpp
-index c344196..0f06740 100644
+index c344196..4355f7e 100644
 --- b/src/gpu/deko3d_backend.cpp
 +++ a/src/gpu/deko3d_backend.cpp
 @@ -39,6 +39,7 @@
@@ -42,7 +42,7 @@ index c344196..0f06740 100644
  };
  
  DkCompareOp CompareOp(xenos::CompareFunction f) { return DkCompareOp(uint32_t(f)); }
-@@ -285,6 +292,293 @@ DkImageSwizzle SwizzleOf(uint32_t s) {
+@@ -285,6 +292,296 @@ DkImageSwizzle SwizzleOf(uint32_t s) {
    }
  }
  
@@ -241,16 +241,19 @@ index c344196..0f06740 100644
 +// ----- on-screen version / fps strip (gh) ---------------------------------------------------------
 +// Rule: every build shows its version on screen. There is no ImGui under deko3d, so the strip is a
 +// 5x7 bitmap font rendered on the CPU into a small RGBA image per frame in flight and drawn with the
-+// present shaders into a viewport at the bottom-left corner. The file sdmc:/switch/gh/overlay_off hides it.
++// present shaders into a viewport at the bottom-left corner. The menu item "overlay" (saved in settings.txt) or the
++// file sdmc:/switch/gh/overlay_off hides it.
 +extern "C" const char* rex_nx_version(void);
 +
 +constexpr uint32_t kOverlayW = 512, kOverlayH = 20, kOverlayScale = 2;
-+// The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x88 panel, 4 lines.
-+constexpr uint32_t kMenuW = 256, kMenuH = 110;
++// The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x130 panel, 5 lines.
++constexpr uint32_t kMenuW = 256, kMenuH = 130;
 +extern "C" volatile int rex_nx_menu_open;
 +extern "C" volatile int rex_nx_menu_cursor;
 +extern "C" volatile int rex_nx_show_fps;
 +extern "C" volatile int rex_nx_sound;
++extern "C" volatile int rex_nx_overlay;
++extern "C" void rex_nx_load_settings(void);
 +
 +struct Glyph {
 +  char ch;
@@ -336,7 +339,7 @@ index c344196..0f06740 100644
  class Deko3dCommandProcessor : public CommandProcessor {
   public:
    using CommandProcessor::CommandProcessor;
-@@ -353,8 +647,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -353,8 +650,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
      if (shader_dir_.empty() || shader_dir_.back() != '/') shader_dir_ += '/';
      size_t cut = shader_dir_.size() >= 2 ? shader_dir_.rfind('/', shader_dir_.size() - 2) : std::string::npos;
      std::string debug_dir = cut == std::string::npos ? "" : shader_dir_.substr(0, cut + 1);
@@ -350,11 +353,11 @@ index c344196..0f06740 100644
 +      sprite_mod_on_ = n > 0;
 +      Log("sprite mod: %zu replacement file(s) in %smods/sprites/", n, debug_dir.c_str());
 +    }
-+    overlay_on_ = access((debug_dir + "overlay_off").c_str(), F_OK) != 0;  // gh: version + fps on screen
++    rex_nx_load_settings();  // gh: rex_nx_overlay (version + fps on screen), settings.txt or the overlay_off marker
      present_vs_ = LoadDksh(shader_dir_ + "present.vert.dksh", present_vs_shader_);
      present_fs_ = LoadDksh(shader_dir_ + "present.frag.dksh", present_fs_shader_);
      Log("deko3d backend up: shaders from %s (%s present shaders), %u MB images, %u MB data per frame",
-@@ -578,17 +881,58 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -578,17 +884,58 @@ class Deko3dCommandProcessor : public CommandProcessor {
  
      // Textures of the pixel shader.
      std::string bound_textures;  // for the draw-type log below
@@ -420,7 +423,7 @@ index c344196..0f06740 100644
        uint32_t slot = DescriptorFor(f, tex, tex->from_resolve ? 0 : fetch.swizzle);
        if (slot == UINT32_MAX) continue;
        uint32_t sampler = (fetch.min_filter == xenos::TextureFilter::kLinear ? 8 : 0) |
-@@ -604,9 +948,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -604,9 +951,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
                  uint32_t(fetch.clamp_y), info.memory.base_size >> 10, tex->from_resolve ? " (a resolve image)" : "");
        }
        DkResHandle handle = dkMakeTextureHandle(slot, sampler);
@@ -432,7 +435,7 @@ index c344196..0f06740 100644
        bound_textures += t;
      }
      {
-@@ -655,7 +999,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -655,7 +1002,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
      }
      // Debug readback at two swaps: what the images hold (uniform colour = a broken stage).
      std::vector<std::pair<std::string, uint32_t>> dumps;
@@ -441,13 +444,13 @@ index c344196..0f06740 100644
        auto queue_dump = [&](const char* what, HostImage* img) {
          if (!img) return;
          uint32_t bytes = img->width * img->height * 4;
-@@ -676,6 +1020,76 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -676,6 +1023,78 @@ class Deko3dCommandProcessor : public CommandProcessor {
        for (auto& it : guest_images_) if (it.second->width >= 600 && it.second != front) { char n[48]; std::snprintf(n, sizeof(n), "guest %08X%s", it.first, it.second->from_resolve ? " (resolve)" : " (upload)"); queue_dump(n, it.second); }
        dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
      }
 +    // gh overlay: the version and the fps, uploaded into this frame's image before the present pass.
 +    HostImage* overlay = nullptr;
-+    if (overlay_on_) {
++    if (rex_nx_overlay) {
 +      const uint64_t now = armGetSystemTick();
 +      if (!fps_tick_) fps_tick_ = now;
 +      fps_frames_++;
@@ -499,7 +502,9 @@ index c344196..0f06740 100644
 +        DrawText(menu_px_.data(), kMenuW, 12, 46, line);
 +        std::snprintf(line, sizeof(line), "%ssound: %s", cur == 2 ? "> " : "  ", rex_nx_sound ? "on" : "off");
 +        DrawText(menu_px_.data(), kMenuW, 12, 66, line);
-+        DrawText(menu_px_.data(), kMenuW, 12, 90, "a ok   b back");
++        std::snprintf(line, sizeof(line), "%soverlay: %s", cur == 3 ? "> " : "  ", rex_nx_overlay ? "on" : "off");
++        DrawText(menu_px_.data(), kMenuW, 12, 86, line);
++        DrawText(menu_px_.data(), kMenuW, 12, 110, "a ok   b back");
 +        const uint32_t bytes = kMenuW * kMenuH * 4;
 +        const uint32_t off = f.staging.Alloc(bytes, 0x100);
 +        if (off != UINT32_MAX) {
@@ -518,7 +523,7 @@ index c344196..0f06740 100644
      if (swaps_ < 5) Log("swap #%u: acquiring a swapchain image", swaps_ + 1);
      int slot = dkQueueAcquireImage(queue_, swapchain_);
      if (swaps_ < 5) Log("swap #%u: slot %d", swaps_ + 1, slot);
-@@ -717,6 +1131,32 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -717,6 +1136,32 @@ class Deko3dCommandProcessor : public CommandProcessor {
          dkCmdBufBindTextures(cmd, DkStage_Fragment, 0, &handle, 1);
          dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
        }
@@ -551,7 +556,7 @@ index c344196..0f06740 100644
      }
      dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
      DkCmdList list = dkCmdBufFinishList(cmd);
-@@ -734,6 +1174,24 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -734,6 +1179,24 @@ class Deko3dCommandProcessor : public CommandProcessor {
          std::unordered_set<uint32_t> distinct;
          for (uint32_t y = 0; y < 16 && h; y++)
            for (uint32_t x = 0; x < 16 && w; x++) distinct.insert(px[(y * h / 16) * w + x * w / 16]);
@@ -576,7 +581,7 @@ index c344196..0f06740 100644
          Log("dump at swap #%u: %s: %zu distinct colours in a 16x16 grid; pixels %08X %08X %08X %08X %08X", swaps_ + 1,
              d.first.c_str(), distinct.size(), w && h ? px[0] : 0, w && h ? px[(h / 4) * w + w / 4] : 0,
              w && h ? px[(h / 2) * w + w / 2] : 0, w && h ? px[(3 * h / 4) * w + 3 * w / 4] : 0, w && h ? px[(h - 1) * w + w - 1] : 0);
-@@ -810,8 +1268,29 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -810,8 +1273,29 @@ class Deko3dCommandProcessor : public CommandProcessor {
    }
  
    // ----- images ---------------------------------------------------------------------------------
@@ -606,7 +611,7 @@ index c344196..0f06740 100644
      DkImageLayoutMaker lm;
      dkImageLayoutMakerDefaults(&lm, device_);
      lm.flags = flags;
-@@ -892,6 +1371,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -892,6 +1376,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
          Log("image at %08X recreated: format %u -> %u, %ux%u -> %ux%u", base, uint32_t(img->format), uint32_t(format), img->width,
              img->height, fresh->width, fresh->height);
          it->second = fresh;
@@ -614,7 +619,7 @@ index c344196..0f06740 100644
          return fresh;
        }
        if (img->width == width && img->height == height) return img;
-@@ -915,7 +1395,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -915,7 +1400,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
        resized->checked_serial = img->checked_serial;
        resized->guest_base = base;
        Log("image at %08X resized %ux%u -> %ux%u", base, img->width, img->height, width, height);
@@ -624,7 +629,7 @@ index c344196..0f06740 100644
        return resized;
      }
      HostImage* img = CreateImage(std::max(width, create_w), std::max(height, create_h), format,
-@@ -953,6 +1434,90 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -953,6 +1439,90 @@ class Deko3dCommandProcessor : public CommandProcessor {
      return img;
    }
  
@@ -715,7 +720,7 @@ index c344196..0f06740 100644
    bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, xenos::Endian endian) {
      const FormatInfo* fi = info.format_info();
      const uint32_t width = info.width + 1, height = info.height + 1;  // TextureInfo keeps size minus one
-@@ -970,7 +1535,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -970,7 +1540,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
        u.offset_y = 0;
        u.width = bw;
        u.height = bh;
@@ -724,7 +729,7 @@ index c344196..0f06740 100644
        u.output_pitch = bw;
        u.input_format_info = fi;
        u.output_format_info = fi;
-@@ -978,9 +1543,26 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -978,9 +1548,26 @@ class Deko3dCommandProcessor : public CommandProcessor {
        texture_conversion::Untile(dst, src, &u);
      } else {
        uint32_t row = bw * bpb;
@@ -752,7 +757,7 @@ index c344196..0f06740 100644
      DkCopyBuf cb{f.staging.gpu + off, 0, 0};
      DkImageView view;
      dkImageViewDefaults(&view, &img.image);
-@@ -1064,6 +1646,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -1064,6 +1651,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
      sys.alpha[1] = float(uint32_t(cc.alpha_func));
      sys.alpha[2] = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
      std::memcpy(sys.bools, &regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], sizeof(sys.bools));
@@ -760,7 +765,7 @@ index c344196..0f06740 100644
      std::memcpy(f.data.cpu + sys_off, &sys, sizeof(sys));
      DkBufExtents vs_bufs[2] = {{f.data.gpu + vs_off, 4096}, {f.data.gpu + sys_off, sizeof(SysConstants)}};
      DkBufExtents ps_bufs[2] = {{f.data.gpu + ps_off, 4096}, {f.data.gpu + sys_off, sizeof(SysConstants)}};
-@@ -1168,8 +1751,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -1168,8 +1756,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
      uint32_t w = info.coordinate_info.width_div_8 * 8, h = info.height_div_8 * 8;
      uint32_t dest_pitch = info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32;
      uint32_t dest_height = info.copy_dest_coordinate_info.height_aligned_div_32 * 32;
@@ -771,7 +776,7 @@ index c344196..0f06740 100644
      if (!dst) return true;
      dst->from_resolve = true;
      dst->content_serial = serial_;
-@@ -1277,6 +1861,20 @@ class Deko3dCommandProcessor : public CommandProcessor {
+@@ -1277,6 +1866,19 @@ class Deko3dCommandProcessor : public CommandProcessor {
    bool present_vs_ = false, present_fs_ = false;
    bool present_target_ = false;
    bool dump_images_ = false;
@@ -781,7 +786,6 @@ index c344196..0f06740 100644
 +  std::unordered_set<uint64_t> dumped_tex_;
 +  std::vector<uint8_t> atlas_top_;  // gh: rows 0..74 of the UI font atlas as staged (little-endian u16), unswapped
 +  HostImage* overlay_[kFrames] = {};  // gh: the version / fps strip, one image per frame in flight
-+  bool overlay_on_ = true;
 +  HostImage* menu_img_[kFrames] = {};  // gh: the settings menu panel
 +  std::vector<uint32_t> menu_px_ = std::vector<uint32_t>(kMenuW * kMenuH);
 +  char overlay_text_[64] = {};
@@ -815,26 +819,64 @@ index e9574be..b157d95 100644
          foreach ($key in $schedule[$t]) {
              if (-not $target) { Write-Output ("{0}s: key {1}: no game window" -f $t, $key); continue }
 diff --git b/switch/host/input/nx_input_driver.cpp a/switch/host/input/nx_input_driver.cpp
-index 72abc5d..3759083 100644
+index 72abc5d..a1c0793 100644
 --- b/switch/host/input/nx_input_driver.cpp
 +++ a/switch/host/input/nx_input_driver.cpp
-@@ -7,10 +7,23 @@
+@@ -3,14 +3,61 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <unistd.h>
+ 
  #include <rex/input/flags.h>
  #include <rex/logging.h>
  
 +// gh: the settings menu drawn by the deko3d backend (src/gpu/deko3d_backend.cpp) reads these.
 +extern "C" {
 +volatile int rex_nx_menu_open = 0;    // 1 while the menu is up: the game sees a neutral pad
-+volatile int rex_nx_menu_cursor = 0;  // 0 resume, 1 fps counter
-+volatile int rex_nx_show_fps = 1;     // the fps number in the on-screen strip (the version always shows)
++volatile int rex_nx_menu_cursor = 0;  // 0 resume, 1 fps counter, 2 sound, 3 overlay
++volatile int rex_nx_show_fps = 1;     // the fps number in the on-screen strip
 +volatile int rex_nx_sound = 1;       // the audio output (audout driver, src/nx_audout_driver.h) plays; 0 = silence
++volatile int rex_nx_overlay = 1;     // the on-screen strip (version + fps) is drawn; 0 = hidden
++
++// The three settings live in sdmc:/switch/gh/settings.txt ("fps=1", "sound=1", "overlay=1", one per line). The
++// file is read once, by whoever asks first (the pad driver or the deko3d backend), and written on every change
++// in the menu. The marker files overlay_off and mute (src/nx_audout_driver.h) still force a start with that
++// setting off.
++static const char* const kSettingsPath = "sdmc:/switch/gh/settings.txt";
++static bool g_settings_loaded = false;
++
++void rex_nx_load_settings(void) {
++  if (g_settings_loaded) return;
++  g_settings_loaded = true;
++  if (FILE* fp = std::fopen(kSettingsPath, "r")) {
++    char line[64];
++    while (std::fgets(line, sizeof(line), fp)) {
++      int v = 0;
++      if (std::sscanf(line, "fps=%d", &v) == 1) rex_nx_show_fps = v != 0;
++      else if (std::sscanf(line, "sound=%d", &v) == 1) rex_nx_sound = v != 0;
++      else if (std::sscanf(line, "overlay=%d", &v) == 1) rex_nx_overlay = v != 0;
++    }
++    std::fclose(fp);
++  }
++  if (access("sdmc:/switch/gh/overlay_off", F_OK) == 0) rex_nx_overlay = 0;
++  std::printf("[nx] settings: fps %d, sound %d, overlay %d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay);
++  std::fflush(stdout);
++}
++
++void rex_nx_save_settings(void) {
++  FILE* fp = std::fopen(kSettingsPath, "w");
++  if (!fp) return;
++  std::fprintf(fp, "fps=%d\nsound=%d\noverlay=%d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay);
++  std::fclose(fp);
++}
 +}
 +
  namespace rex::input::nx {
  
  namespace {
  
-+constexpr int kMenuItems = 3;
++constexpr int kMenuItems = 4;
 +bool g_combo_prev = false;
 +bool g_neutral = false;  // neutral pad for the game until every button is released
 +uint16_t g_prev_all = 0;
@@ -842,7 +884,15 @@ index 72abc5d..3759083 100644
  constexpr DeviceId kPad = static_cast<DeviceId>(0x4E580000);  // "NX"
  
  // Positional mapping: the Switch's B/A/Y/X sit where the 360's A/B/X/Y sit.
-@@ -170,13 +183,46 @@ X_RESULT NXInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+@@ -52,6 +99,7 @@ X_STATUS NXInputDriver::Setup() {
+   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+   padInitializeDefault(&pad_);
+   REXLOG_INFO("[nx] input: libnx pad (handheld / Joy-Con pair / Pro Controller) as gamepad 0");
++  rex_nx_load_settings();
+   return X_STATUS_SUCCESS;
+ }
+ 
+@@ -170,13 +218,53 @@ X_RESULT NXInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
      for (const ButtonMap& m : kButtons) {
        if (held & m.nx) buttons |= m.x360;
      }
@@ -857,6 +907,8 @@ index 72abc5d..3759083 100644
 +        rex_nx_menu_open = !rex_nx_menu_open;
 +        rex_nx_menu_cursor = 0;
 +        g_neutral = true;
++        std::printf("[nx] menu: %s (start+back)\n", rex_nx_menu_open ? "open" : "closed");
++        std::fflush(stdout);
 +      }
 +      g_combo_prev = combo;
 +      if (rex_nx_menu_open) {
@@ -866,7 +918,12 @@ index 72abc5d..3759083 100644
 +        if (pressed & X_INPUT_GAMEPAD_B) {  // the Switch A button (right) confirms
 +          if (rex_nx_menu_cursor == 0) rex_nx_menu_open = 0;
 +          else if (rex_nx_menu_cursor == 1) rex_nx_show_fps = !rex_nx_show_fps;
-+          else rex_nx_sound = !rex_nx_sound;
++          else if (rex_nx_menu_cursor == 2) rex_nx_sound = !rex_nx_sound;
++          else rex_nx_overlay = !rex_nx_overlay;
++          if (rex_nx_menu_cursor) rex_nx_save_settings();
++          std::printf("[nx] menu: item %d confirmed: fps %d, sound %d, overlay %d\n", rex_nx_menu_cursor, rex_nx_show_fps,
++                      rex_nx_sound, rex_nx_overlay);
++          std::fflush(stdout);
 +        }
 +        if (pressed & X_INPUT_GAMEPAD_A) rex_nx_menu_open = 0;  // the Switch B button (bottom) goes back
 +        g_neutral = true;
