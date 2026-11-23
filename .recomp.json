@@ -1,0 +1,20 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Guardian Heroes",
+  "system": "Xbox 360",
+  "type": "recomp",
+  "project": "Guardian Heroes Recompiled",
+  "status": "playable",
+  "targets": [
+    "Switch",
+    "Linux"
+  ],
+  "toolchain": "Rexglue",
+  "approach": "Static recompilation, deko3d renderer on Switch",
+  "maintainers": [
+    {
+      "name": "rashevskyv",
+      "link": "https://github.com/rashevskyv"
+    }
+  ]
+}
