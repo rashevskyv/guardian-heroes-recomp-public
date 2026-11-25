@@ -477,6 +477,8 @@ edit('src/codegen/builders/helpers.h', [
 ])
 edit('src/codegen/builders/system.cpp', [
     ('memset((void*)REX_RAW_ADDR({}), 0, 32);', 'memset((void*)REX_RAW_STORE_ADDR({}), 0, 32);'),
+    # dcbzl (128 bytes, the guest memset's zero fill): it had no mark, a texture cleared by memset stayed stale on the GPU.
+    ('memset((void*)REX_RAW_ADDR({}), 0, 128);', 'memset((void*)REX_RAW_STORE_ADDR({}), 0, 128);'),
 ])
 print('changed (3):', *changed, sep=NL + '  ')
 
@@ -1347,3 +1349,12 @@ for f in ('src/graphics/vulkan/render_target_cache.cpp', 'src/graphics/vulkan/te
     edit(f, [('#include <rex/graphics/vulkan/' + f.split('/')[-1].replace('.cpp', '.h') + '>' + NL,
               '#include <rex/graphics/vulkan/' + f.split('/')[-1].replace('.cpp', '.h') + '>' + NL + '#include <atomic>' + NL)], must=False)
 print('changed (27):', *changed, sep=NL + '  ')
+
+# --- Swap counter for the clock governor (switch_nx.cpp govern(): frames lost in the last second). A separate edit on the
+# FPS edit's result, so a rerun finds both texts. The asm label keeps the plain C symbol from inside a namespace. ---
+edit('src/graphics/command_processor.cpp', [
+    ('      nx_frames++;' + NL,
+     '      nx_frames++;' + NL +
+     '      extern volatile uint64_t rex_nx_swaps __asm__("rex_nx_swaps");  // switch_nx.cpp' + NL +
+     '      rex_nx_swaps = rex_nx_swaps + 1;' + NL),
+])

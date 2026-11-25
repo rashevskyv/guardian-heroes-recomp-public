@@ -2,7 +2,7 @@
 """Builds and runs tools/sprite_mod_test.cpp against PNGs made with Pillow: decode must match Pillow exactly
 (RGB, RGBA, palette, gray, 16 bit, all filters through Pillow's optimiser), quantising must stay close, and the hash
 must match tools/spritemod.py's. Needs g++. Run from the repo root."""
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
 import numpy as np
 from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,4 +84,18 @@ print('ok  ' if ok else 'FAIL', 'broken file:', r); fails += not ok
 r = run('find', d, '99', '99', '5')[0]
 ok = 'found 0' in r
 print('ok  ' if ok else 'FAIL', 'unknown id:', r); fails += not ok
+# true-colour store (mods/textures/): the PNG comes back as RGBA, unquantised, also for an indexed PNG; size prefilter
+td = os.path.join(tmp, 'tex'); os.makedirs(td)
+Image.fromarray(np.dstack([many, (many[..., 0] // 2).astype(np.uint8)]), 'RGBA').save(os.path.join(td, 'p_t16__70x60_00000000000000bb.png'))
+ip.save(os.path.join(td, 'p_t17__12x10_00000000000000cc.png'))
+for wh, hx, name in (('70x60', 'bb', 'p_t16__70x60_00000000000000bb.png'), ('12x10', 'cc', 'p_t17__12x10_00000000000000cc.png')):
+    w, h = wh.split('x')
+    want = '%016x' % sprite_hash(np.asarray(Image.open(os.path.join(td, name)).convert('RGBA')).tobytes())
+    r = run('tfind', td, w, h, hx)[0]
+    ok = r.startswith('files 2 size 1 other 0 found 1 %s tc=1 idx=0 rgba=%s' % (wh, want)) and 'err=[]' in r
+    print('ok  ' if ok else 'FAIL', 'true-colour store %s:' % wh, r); fails += not ok
+r = run('tfind', td, '70', '60', '1')[0]
+ok = r.startswith('files 2 size 1 other 0 found 0') and 'err=[]' in r
+print('ok  ' if ok else 'FAIL', 'true-colour store, size known, no file:', r); fails += not ok
+shutil.rmtree(tmp)
 sys.exit(1 if fails else 0)

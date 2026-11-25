@@ -27,3 +27,26 @@ reserved_as_local = false
 # The explicit end makes the copy complete (same pattern as cvhd's 0x8277ECF0). The next function starts at 0x826C6E68.
 [entrypoint.functions.0x826C6740]
 end = 0x826C6E68
+
+# Cheats (src/cheats.cpp): keep player health at maximum right after the game's damage code wrote it.
+# Addresses are the stores of the health (+202) in the damage functions; the hook runs before the instruction.
+[[entrypoint.midasm_hook]]
+address = 0x824A275C
+name = "GhKeepHealthMax"
+registers = ["r31"]
+
+[[entrypoint.midasm_hook]]
+address = 0x824A20E8
+name = "GhKeepSharedHealthMax"
+registers = ["r30", "r11"]
+
+[[entrypoint.midasm_hook]]
+address = 0x824A0FAC
+name = "GhKeepHealthMax"
+registers = ["r29"]
+
+# Level select (src/cheats.cpp): inside sub_82489160 (new story game), after the reset and the stage-select store,
+# before sub_824F48E8 is called. The hook may overwrite the stage byte at game state +0x3AF.
+[[entrypoint.midasm_hook]]
+address = 0x824891EC
+name = "GhStartLevel"

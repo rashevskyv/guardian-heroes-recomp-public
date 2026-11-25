@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <utility>
 
 namespace gh {
 
@@ -375,10 +376,12 @@ bool QuantiseRgba(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, ModS
 }
 
 // ----- the store ---------------------------------------------------------------------------------------------
-size_t SpriteMod::Init(const std::string& dir) {
+size_t SpriteMod::Init(const std::string& dir, bool true_colour) {
   dir_ = dir;
   if (!dir_.empty() && dir_.back() != '/') dir_ += '/';
+  true_colour_ = true_colour;
   files_.clear();
+  sizes_.clear();
   DIR* d = opendir(dir_.c_str());
   if (!d) return 0;
   while (dirent* e = readdir(d)) {
@@ -388,12 +391,15 @@ size_t SpriteMod::Init(const std::string& dir) {
     size_t p = stem.rfind("__");
     std::string id = p == std::string::npos ? stem : stem.substr(p + 2);
     files_[id] = dir_ + n;
+    unsigned w = 0, h = 0;
+    if (std::sscanf(id.c_str(), "%ux%u_", &w, &h) == 2) sizes_.insert((uint64_t(w) << 32) | h);
   }
   closedir(d);
   return files_.size();
 }
 
 ModSprite* SpriteMod::Find(uint32_t w, uint32_t h, uint64_t hash) {
+  error_.clear();
   if (files_.empty()) return nullptr;
   const std::string id = SpriteId(w, h, hash);
   auto lit = loaded_.find(id);
@@ -415,9 +421,12 @@ ModSprite* SpriteMod::Find(uint32_t w, uint32_t h, uint64_t hash) {
   uint32_t pw = 0, ph = 0;
   std::vector<uint8_t> rgba, indices;
   if (file.empty()) error_ = "cannot read " + fit->second;
-  else if (DecodePng(file, pw, ph, rgba, error_, &indices)) {
+  else if (DecodePng(file, pw, ph, rgba, error_, true_colour_ ? nullptr : &indices)) {
     auto* s = new ModSprite();
-    if (!indices.empty()) {
+    if (true_colour_) {
+      s->w = pw; s->h = ph; s->true_colour = true; s->rgba = std::move(rgba);
+      result = s;
+    } else if (!indices.empty()) {
       s->w = pw; s->h = ph; s->index = indices; s->game_palette = true;
       result = s;
     } else if (QuantiseRgba(rgba, pw, ph, *s)) result = s;

@@ -39,6 +39,7 @@
 #include <rex/string/buffer.h>
 #include <rex/system/gpu_plugin.h>
 
+#include "tile_pitch.h"
 #include "../sprite_mod.h"  // gh: sprite replacement
 #include "ucode_hash.h"
 
@@ -78,11 +79,15 @@ constexpr uint32_t kStagingBytes = 24u << 20;    // texture uploads of one frame
 constexpr uint32_t kImagePoolBytes = 448u << 20;
 constexpr uint32_t kCodePoolBytes = 4u << 20;
 constexpr uint32_t kMaxImageDescriptors = 512;
-constexpr uint32_t kSamplerCount = 16;  // min filter x mag filter x wrap x x wrap y
+constexpr uint32_t kSamplerCount = 64;  // min filter x mag filter x wrap x (clamp, repeat, mirror) x wrap y
 constexpr uint32_t kPresentWidth = 1280;
 constexpr uint32_t kPresentHeight = 720;
 constexpr uint32_t kEdramTiles = 2048;  // 10 MB of 5120-byte tiles (80 x 16 x 32 bit)
 constexpr uint32_t kMaxTargetHeight = 1088;
+// gh: a sampler wrap code (0 clamp, 1 repeat, 2 mirrored repeat) of a fetch constant clamp mode: the forest stage backgrounds use
+// mirrored repeat and streaked horizontally when it was a clamp.
+constexpr uint32_t WrapCodeOf(xenos::ClampMode m) { return m == xenos::ClampMode::kRepeat ? 1 : m == xenos::ClampMode::kMirroredRepeat ? 2 : 0; }
+constexpr DkWrapMode WrapOf(uint32_t code) { return code == 1 ? DkWrapMode_Repeat : code == 2 ? DkWrapMode_MirroredRepeat : DkWrapMode_ClampToEdge; }
 
 void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void Log(const char* fmt, ...) {
@@ -136,13 +141,15 @@ struct HostImage {
   DkImageFormat format = DkImageFormat_RGBA8_Unorm;
   uint32_t width = 0, height = 0;
   bool is_depth = false;
+  uint32_t pool_off = 0, pool_size = 0, pool_align = 0;  // gh: its slot in the image pool (a full pool reuses a recycled slot)
   uint32_t flags = 0;         // gh: the layout flags (a recycled image must match)
   bool from_resolve = false;  // host-native channels: the fetch swizzle is not applied
   uint32_t content_serial = 0;  // the draw serial when the contents were set (upload or resolve); 0 = never
   uint32_t checked_serial = 0;  // the draw serial of the last dirty-page check
+  uint64_t content_hash = 0;    // gh: textures of 4 KB or less (palettes): the hash of the guest bytes at the upload
   uint32_t guest_base = 0;    // textures and resolve destinations
   uint32_t edram_base = 0, edram_pitch = 0;  // render targets
-  ::gh::ModSprite* mod = nullptr;  // gh: the replacement for this 8 bit sprite texture's contents, if the mod folder has one
+  ::gh::ModSprite* mod = nullptr;  // gh: the replacement for this texture's contents (8 bit sprite or true-colour), if a mod folder has one
 };
 
 class DkShaderObj : public Shader {
@@ -350,7 +357,7 @@ static bool AtlasCellIs(const uint8_t* atlas, int i) {
 static bool SwapAtlasGlyphs(uint8_t* atlas) {
   for (int i = 0; i < 4; i++)
     if (!AtlasCellIs(atlas, i)) return false;
-  for (int pair = 0; pair < 2; pair++) {
+  for (int pair = 1; pair < 2; pair++) {  // X<->Y only: Switch A/B now map to the Xbox A/B by name, so A and B keep their cells
     const GlyphCell a = kAtlasGlyph[pair * 2], b = kAtlasGlyph[pair * 2 + 1];
     for (uint32_t y = 0; y < kGlyphH; y++) {
       uint8_t* ra = atlas + (size_t(a.y + y) * kAtlasW + a.x) * 2;
@@ -363,7 +370,7 @@ static bool SwapAtlasGlyphs(uint8_t* atlas) {
 
 // Replaces the green A disc of the title's "PRESS A BUTTON" (staged k_8_8_8_8, bytes B G R A, 288x96, disc at
 // 126..148 x 36..58) by the red B icon read from the original atlas data `atlas` (the B cell, not swapped yet).
-static bool ReplaceTitleGlyph(uint8_t* tex, const uint8_t* atlas) {
+[[maybe_unused]] static bool ReplaceTitleGlyph(uint8_t* tex, const uint8_t* atlas) {
   constexpr int cx = 137, cy = 47, radius = 13, w = 288;
   uint32_t green = 0;
   for (int y = cy - 11; y <= cy + 11; y++)
@@ -492,14 +499,20 @@ static bool DecodeStaged(const char* fmt, const uint8_t* s, uint32_t w, uint32_t
 extern "C" const char* rex_nx_version(void);
 
 constexpr uint32_t kOverlayW = 512, kOverlayH = 20, kOverlayScale = 2;
-// The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x130 panel, 5 lines.
-constexpr uint32_t kMenuW = 256, kMenuH = 130;
+// The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x214 panel, 9 lines.
+constexpr uint32_t kMenuW = 256, kMenuH = 192;
 extern "C" volatile int rex_nx_menu_open;
 extern "C" volatile int rex_nx_menu_cursor;
+extern "C" volatile int rex_nx_menu_page;  // 0 main, 1 cheats
 extern "C" volatile int rex_nx_show_fps;
 extern "C" volatile int rex_nx_sound;
+extern "C" volatile int rex_nx_hatching;     // the menu: 0 = no pencil hatching (PS CE23671D gets an empty mask)
+extern "C" volatile int rex_nx_sprite_mods;  // the menu: 0 = replaced sprites are drawn as the game's own
 extern "C" volatile int rex_nx_overlay;
+extern "C" volatile int rex_nx_cheat_invincible, rex_nx_cheat_mp, rex_nx_cheat_continues, rex_nx_cheat_attributes;
 extern "C" void rex_nx_load_settings(void);
+extern "C" volatile int rex_nx_start_level;
+extern "C" const char* rex_nx_level_name(int n);
 
 struct Glyph {
   char ch;
@@ -527,10 +540,12 @@ constexpr Glyph kGlyphs[] = {
     {'f', {6, 9, 8, 28, 8, 8, 8}},
     {'G', {14, 17, 16, 23, 17, 17, 15}},
     {'H', {17, 17, 17, 31, 17, 17, 17}},
+    {'h', {16, 16, 22, 25, 17, 17, 17}},
+    {'-', {0, 0, 0, 31, 0, 0, 0}},
     {'v', {0, 0, 17, 17, 17, 10, 4}},
     {'p', {0, 0, 30, 17, 30, 16, 16}},
     {'s', {0, 0, 15, 16, 14, 1, 30}},
-    {'g', {0, 15, 17, 17, 15, 1, 14}},
+    {'g', {0, 0, 15, 17, 17, 15, 1}},
     {'i', {4, 0, 12, 4, 4, 4, 14}},
     {'k', {16, 16, 18, 20, 24, 20, 18}},
     {'l', {12, 4, 4, 4, 4, 4, 14}},
@@ -619,16 +634,16 @@ class Deko3dCommandProcessor : public CommandProcessor {
       f.desc_offset = i * kMaxImageDescriptors * sizeof(DkImageDescriptor);
     }
     sampler_desc_offset_ = kFrames * kMaxImageDescriptors * sizeof(DkImageDescriptor);
-    // Samplers: min filter (bit 3) x mag filter (bit 2) x wrap x (bit 1) x wrap y (bit 0); the text
+    // Samplers: min filter (bit 5) x mag filter (bit 4) x wrap x (bits 3-2) x wrap y (bits 1-0), wrap 0 clamp, 1 repeat, 2 mirrored repeat; the text
     // lost thin strokes when its minification took the nearest magnification filter.
     for (uint32_t i = 0; i < kSamplerCount; i++) {
       DkSampler s;
       dkSamplerDefaults(&s);
-      s.minFilter = (i & 8) ? DkFilter_Linear : DkFilter_Nearest;
-      s.magFilter = (i & 4) ? DkFilter_Linear : DkFilter_Nearest;
+      s.minFilter = (i & 32) ? DkFilter_Linear : DkFilter_Nearest;
+      s.magFilter = (i & 16) ? DkFilter_Linear : DkFilter_Nearest;
       s.mipFilter = DkMipFilter_None;
-      s.wrapMode[0] = (i & 2) ? DkWrapMode_Repeat : DkWrapMode_ClampToEdge;
-      s.wrapMode[1] = (i & 1) ? DkWrapMode_Repeat : DkWrapMode_ClampToEdge;
+      s.wrapMode[0] = WrapOf((i >> 2) & 3);
+      s.wrapMode[1] = WrapOf(i & 3);
       s.wrapMode[2] = DkWrapMode_ClampToEdge;
       DkSamplerDescriptor sd;
       dkSamplerDescriptorInitialize(&sd, &s);
@@ -659,8 +674,22 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const size_t n = sprite_mod_.Init(debug_dir + "mods/sprites/");
       sprite_mod_on_ = n > 0;
       Log("sprite mod: %zu replacement file(s) in %smods/sprites/", n, debug_dir.c_str());
+      // gh: true-colour textures (portraits), sdmc:/switch/gh/mods/textures/<name>__<id>.png, drawn as RGBA
+      const size_t t = texture_mod_.Init(debug_dir + "mods/textures/", true);
+      texture_mod_on_ = t > 0;
+      Log("texture mod: %zu replacement file(s) in %smods/textures/", t, debug_dir.c_str());
     }
     rex_nx_load_settings();  // gh: rex_nx_overlay (version + fps on screen), settings.txt or the overlay_off marker
+    {
+      // gh: settings.txt "dump_tex=N" (default 0): the raw guest bytes of the first N distinct textures of 256x256 or more.
+      if (FILE* fp = std::fopen((debug_dir + "settings.txt").c_str(), "r")) {
+        char line[64];
+        int v = 0;
+        while (std::fgets(line, sizeof(line), fp)) if (std::sscanf(line, "dump_tex=%d", &v) == 1) raw_dump_left_ = v > 0 ? uint32_t(v) : 0;
+        std::fclose(fp);
+      }
+      if (raw_dump_left_) { mkdir((debug_dir + "texdump").c_str(), 0777); Log("dump_tex: the first %u large textures go to %stexdump/", raw_dump_left_, debug_dir.c_str()); }
+    }
     present_vs_ = LoadDksh(shader_dir_ + "present.vert.dksh", present_vs_shader_);
     present_fs_ = LoadDksh(shader_dir_ + "present.frag.dksh", present_fs_shader_);
     Log("deko3d backend up: shaders from %s (%s present shaders), %u MB images, %u MB data per frame",
@@ -908,14 +937,24 @@ class Deko3dCommandProcessor : public CommandProcessor {
         continue;
       }
       pt.tex = TextureImage(f, pt.info, pt.fetch);
-      if (!pt.tex) continue;
+      if (!pt.tex) {
+        char key[40];
+        std::snprintf(key, sizeof(key), "notex %08X", pt.info.memory.base_address);
+        LogOnce(key, "texture at %08X (%s %ux%u) has no image: fetch %u keeps its previous binding", pt.info.memory.base_address,
+                pt.info.format_info()->name, pt.info.width + 1, pt.info.height + 1, tb.fetch_constant);
+        continue;
+      }
       pt.fetch_constant = tb.fetch_constant;
       pending_count++;
     }
-    if (sprite_mod_on_) {
+    if (sprite_mod_on_ && rex_nx_sprite_mods) {
       for (size_t i = 0; i < pending_count; i++) {
-        if (pending[i].tex->mod && sprite_slot < 0) sprite_slot = int(i);
-        else if (pending[i].info.width + 1 == 256 && std::strcmp(pending[i].info.format_info()->name, "k_8_8_8_8") == 0 && clut_slot < 0) clut_slot = int(i);
+        if (pending[i].tex->mod && !pending[i].tex->mod->true_colour && sprite_slot < 0) sprite_slot = int(i);
+        else if (pending[i].info.width + 1 == 256 && std::strcmp(pending[i].info.format_info()->name, "k_8_8_8_8") == 0 &&
+                 // gh: the hatch shader CE23671D fetches tf0, tf3 (the hatch mask, also 256x1), tf1 (the palette): the first
+                 // match was the mask, so the replacement's palette went to tf3 and its indices read the game's palette
+                 // (black above entry ~30: black Valgar with speckles). The palette is fetch 1 in both sprite shaders.
+                 (clut_slot < 0 || pending[i].fetch_constant == 1)) clut_slot = int(i);
       }
       if (sprite_slot >= 0) {
         if (pending[sprite_slot].tex->mod->game_palette) {
@@ -933,14 +972,23 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const auto& fetch = pending[pi].fetch;
       const auto& info = pending[pi].info;
       HostImage* tex = pending[pi].tex;
+      bool identity = false;  // gh: a true-colour replacement is plain RGBA: no fetch swizzle
       if (int(pi) == sprite_slot) tex = mod_index;
       else if (int(pi) == clut_slot && sprite_slot >= 0) tex = mod_clut;
+      // gh: hatching off (the menu): the hatch mask (tf3 of the sprite shader) is an all-zero image, so the shader's
+      // "mask > 0" branch never runs. No other shader hatches (it is the only one with four textures).
+      if (!rex_nx_hatching && pending[pi].fetch_constant == 3 && ps->ucode_data_hash() == 0xCE23671D5EFA0EDBull) {
+        if (HostImage* z = NoHatchImage(f)) tex = z;
+      }
+      else if (tex->mod && tex->mod->true_colour) {
+        if (HostImage* r = ModRgbaImage(f, tex->mod)) { tex = r; identity = true; }  // not ready: the original this time
+      }
       const uint32_t fc = pending[pi].fetch_constant;
-      uint32_t slot = DescriptorFor(f, tex, tex->from_resolve ? 0 : fetch.swizzle);
+      uint32_t slot = DescriptorFor(f, tex, (identity || tex->from_resolve) ? 0 : fetch.swizzle);
       if (slot == UINT32_MAX) continue;
-      uint32_t sampler = (fetch.min_filter == xenos::TextureFilter::kLinear ? 8 : 0) |
-                         (fetch.mag_filter == xenos::TextureFilter::kLinear ? 4 : 0) |
-                         (fetch.clamp_x == xenos::ClampMode::kRepeat ? 2 : 0) | (fetch.clamp_y == xenos::ClampMode::kRepeat ? 1 : 0);
+      uint32_t sampler = (fetch.min_filter == xenos::TextureFilter::kLinear ? 32 : 0) |
+                         (fetch.mag_filter == xenos::TextureFilter::kLinear ? 16 : 0) |
+                         (WrapCodeOf(fetch.clamp_x) << 2) | WrapCodeOf(fetch.clamp_y);
       {
         // Each texture's first bind, once: what the game draws with (correlates with the uploads).
         char key[32];
@@ -963,6 +1011,114 @@ class Deko3dCommandProcessor : public CommandProcessor {
                     (unsigned long long)ps->ucode_data_hash(), bound_textures.c_str());
       LogOnce(key, "draw VS %016llX PS %016llX prim %u n=%u:%s", (unsigned long long)vs->ucode_data_hash(),
               (unsigned long long)ps->ucode_data_hash(), uint32_t(prim_type), index_count, bound_textures.empty() ? " no textures" : bound_textures.c_str());
+    }
+
+    // gh: diagnostics for the black enemy sprites (Valgar, the ninja, the dragon). The sprite shader: idx = tf0; colour =
+    // tf1[idx] + c3; where tf3[idx].x > 0 the colour is multiplied by c255.x - tf2(uv * c2 + c1).w (the pencil hatching);
+    // the result times c0. One line per character (the tf3 base) and again when its palettes or c0/c3/c255 change (8 per
+    // character, 160 in all). Read: c3 (negative = the game darkens), c0, c255.x (1 expected), the mask count, the hatch range.
+    if (ps->ucode_data_hash() == 0xCE23671D5EFA0EDBull && sprdiag_lines_ < 160) {
+      const PendingTex* t[4] = {};
+      for (size_t i = 0; i < pending_count; i++) if (pending[i].fetch_constant < 4) t[pending[i].fetch_constant] = &pending[i];
+      if (t[0] && t[1] && t[2] && t[3] && t[1]->info.memory.base_size >= 1024 && t[3]->info.memory.base_size >= 1024) {
+        float c[5][4];
+        const uint32_t ci[5] = {0, 1, 2, 3, 255};
+        for (int i = 0; i < 5; i++) for (int k = 0; k < 4; k++) c[i][k] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + ci[i] * 4 + k);
+        const uint8_t* pal = memory_->TranslatePhysical(t[1]->info.memory.base_address);
+        const uint8_t* mask = memory_->TranslatePhysical(t[3]->info.memory.base_address);
+        float keyed[12];
+        std::memcpy(keyed, c[0], 16); std::memcpy(keyed + 4, c[3], 16); std::memcpy(keyed + 8, c[4], 16);
+        const uint64_t state = ::gh::SpriteHash(pal, 1024) ^ (::gh::SpriteHash(mask, 1024) * 3) ^
+                               (::gh::SpriteHash(reinterpret_cast<const uint8_t*>(keyed), sizeof(keyed)) * 5);
+        auto& seen = sprdiag_[t[3]->info.memory.base_address];
+        if (seen.second < 8 && (!seen.second || seen.first != state)) {
+          seen.first = state;
+          const bool first = seen.second++ == 0;
+          sprdiag_lines_++;
+          uint32_t nz[4] = {}, lit = 0;
+          for (uint32_t i = 0; i < 256; i++) {
+            for (int k = 0; k < 4; k++) nz[k] += mask[i * 4 + k] != 0;
+            lit += pal[i * 4] != 0;  // guest bytes A, R, G, B
+          }
+          float q[4] = {};
+          if (!vs->vertex_bindings().empty()) {
+            const auto& vb = vs->vertex_bindings()[0];
+            auto vf = regs.GetVertexFetch(vb.fetch_constant);
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(vf.address << 2));
+            const uint32_t at[4] = {0, 1, vb.stride_words, vb.stride_words * 2 + 1};  // v0.x, v0.y, v1.x, v2.y
+            for (int i = 0; i < 4; i++) if (at[i] < vf.size) {
+              uint32_t v = vf.endian == xenos::Endian::k8in32 ? __builtin_bswap32(w[at[i]]) : w[at[i]];
+              std::memcpy(&q[i], &v, 4);
+            }
+          }
+          // The index texels that land on a black palette entry (0 = the index data fits the palette: the fault is then
+          // in the draw state, not in the textures) and the blend state of this draw.
+          uint32_t black_texels = 0, texels = 0;
+          {
+            const uint8_t* ix = memory_->TranslatePhysical(t[0]->info.memory.base_address);
+            for (uint32_t i = 0; i < t[0]->info.memory.base_size; i++) {
+              const uint8_t* e = pal + ix[i] * 4;
+              texels += ix[i] != 0;
+              black_texels += ix[i] != 0 && !(e[1] | e[2] | e[3]);
+            }
+          }
+          // A 16 colour character (the black ones: the mech, the dragon): its raw index bytes, 4 files at most, to compare
+          // with the frame in chara.mrg (the same tiled bytes).
+          // gh: the trigger was `lit <= 17`, but lit counts alpha (255 for every palette), so 0.96 wrote no file.
+          // The black sprites are the ones with a frame side above 320 (mech, dragon); the good ones stay at 320 or less.
+          if ((t[0]->info.width >= 320 || t[0]->info.height >= 320) && sprdiag_files_ < 4) {
+            sprdiag_files_++;
+            mkdir((debug_dir_ + "texdump").c_str(), 0777);
+            char path[200];
+            std::snprintf(path, sizeof(path), "%stexdump/spr_%08X_%ux%u.bin", debug_dir_.c_str(), t[0]->info.memory.base_address, t[0]->info.width + 1,
+                          t[0]->info.height + 1);
+            if (FILE* fp = std::fopen(path, "wb")) {
+              std::fwrite(memory_->TranslatePhysical(t[0]->info.memory.base_address), 1, t[0]->info.memory.base_size, fp);
+              std::fclose(fp);
+              Log("sprdiag file %s (%u bytes, the host image is %ux%u%s)", path, uint32_t(t[0]->info.memory.base_size), t[0]->tex->width, t[0]->tex->height,
+                  t[0]->tex->from_resolve ? ", a resolve image" : "");
+            } else {
+              Log("sprdiag file %s: cannot open", path);
+            }
+          }
+          auto bl = regs.Get<reg::RB_BLENDCONTROL>();
+          Log("sprdiag state mask %08X: blend colour %u/%u op %u alpha %u/%u op %u, constant %g %g %g %g, write mask %x, alpha test %u; index texels %u, on black "
+              "palette entries %u", t[3]->info.memory.base_address, uint32_t(bl.color_srcblend), uint32_t(bl.color_destblend), uint32_t(bl.color_comb_fcn),
+              uint32_t(bl.alpha_srcblend), uint32_t(bl.alpha_destblend), uint32_t(bl.alpha_comb_fcn), regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
+              regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN), regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
+              regs.values[XE_GPU_REG_RB_COLOR_MASK] & 0xF, uint32_t(regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable), texels, black_texels);
+          Log("sprdiag #%u mask %08X pal %08X idx %08X %ux%u quad %.0f,%.0f..%.0f,%.0f | c0 %g %g %g %g | c1 %g %g | c2 %g %g | c3 %g %g %g %g | "
+              "c255 %g %g %g %g | mask nonzero per byte %u %u %u %u | pal alpha>0 %u | idx filter %u/%u mod %d/%d",
+              seen.second, t[3]->info.memory.base_address, t[1]->info.memory.base_address, t[0]->info.memory.base_address, t[0]->info.width + 1,
+              t[0]->info.height + 1, q[0], q[1], q[2], q[3], c[0][0], c[0][1], c[0][2], c[0][3], c[1][0], c[1][1], c[2][0], c[2][1], c[3][0],
+              c[3][1], c[3][2], c[3][3], c[4][0], c[4][1], c[4][2], c[4][3], nz[0], nz[1], nz[2], nz[3], lit, uint32_t(t[0]->fetch.min_filter),
+              uint32_t(t[0]->fetch.mag_filter), sprite_slot, clut_slot);
+          if (first) {
+            std::string hex[2];
+            for (int p = 0; p < 2; p++) for (uint32_t i = 0; i < 1024; i++) {
+              char h[4];
+              std::snprintf(h, sizeof(h), "%02X", (p ? mask : pal)[i]);
+              hex[p] += h;
+            }
+            Log("sprdiag pal %08X bytes ARGB: %s", t[1]->info.memory.base_address, hex[0].c_str());
+            Log("sprdiag mask %08X bytes ARGB: %s", t[3]->info.memory.base_address, hex[1].c_str());
+            char key[32];
+            std::snprintf(key, sizeof(key), "hatch %08X", t[2]->info.memory.base_address);
+            if (!logged_.count(key) && t[2]->info.memory.base_size >= 4096) {
+              const uint8_t* h = memory_->TranslatePhysical(t[2]->info.memory.base_address);
+              const uint32_t n = std::min<uint32_t>(t[2]->info.memory.base_size, 16384) / 4;
+              uint32_t lo[4] = {255, 255, 255, 255}, hi[4] = {}, sum[4] = {};
+              for (uint32_t i = 0; i < n; i++) for (int k = 0; k < 4; k++) {
+                const uint32_t v = h[i * 4 + k];
+                lo[k] = std::min(lo[k], v); hi[k] = std::max(hi[k], v); sum[k] += v;
+              }
+              LogOnce(key, "sprdiag hatch %08X %ux%u swizzle %03X clamp %u/%u: byte lanes A R G B min/max/mean %u/%u/%u %u/%u/%u %u/%u/%u %u/%u/%u",
+                      t[2]->info.memory.base_address, t[2]->info.width + 1, t[2]->info.height + 1, t[2]->fetch.swizzle, uint32_t(t[2]->fetch.clamp_x),
+                      uint32_t(t[2]->fetch.clamp_y), lo[0], hi[0], sum[0] / n, lo[1], hi[1], sum[1] / n, lo[2], hi[2], sum[2] / n, lo[3], hi[3], sum[3] / n);
+            }
+          }
+        }
+      }
     }
 
     // Uniforms: the ALU constants and the system constants, per stage.
@@ -1025,7 +1181,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     // gh overlay: the version and the fps, uploaded into this frame's image before the present pass.
     HostImage* overlay = nullptr;
-    if (rex_nx_overlay) {
+    // The fps number does not depend on the overlay flag: the strip is drawn when either is on.
+    if (rex_nx_overlay || rex_nx_show_fps) {
       const uint64_t now = armGetSystemTick();
       if (!fps_tick_) fps_tick_ = now;
       fps_frames_++;
@@ -1038,8 +1195,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
       overlay = overlay_[frame_];
       if (overlay) {
         char text[64];
-        if (rex_nx_show_fps) std::snprintf(text, sizeof(text), "GH %s  %u.%u fps", rex_nx_version(), fps_x10_ / 10, fps_x10_ % 10);
-        else std::snprintf(text, sizeof(text), "GH %s", rex_nx_version());
+        if (rex_nx_overlay && rex_nx_show_fps) std::snprintf(text, sizeof(text), "GH %s  %u.%u fps", rex_nx_version(), fps_x10_ / 10, fps_x10_ % 10);
+        else if (rex_nx_overlay) std::snprintf(text, sizeof(text), "GH %s", rex_nx_version());
+        else std::snprintf(text, sizeof(text), "%u.%u fps", fps_x10_ / 10, fps_x10_ % 10);
         if (std::strcmp(text, overlay_text_) != 0) {
           RenderOverlayText(overlay_px_.data(), text);
           std::memcpy(overlay_text_, text, sizeof(overlay_text_));
@@ -1070,16 +1228,31 @@ class Deko3dCommandProcessor : public CommandProcessor {
         for (uint32_t y = 0; y < kMenuH; y++) menu_px_[y * kMenuW] = menu_px_[y * kMenuW + kMenuW - 1] = 0xFFFFFFFFu;
         const int cur = rex_nx_menu_cursor;
         char line[32];
-        DrawText(menu_px_.data(), kMenuW, 12, 6, "settings");
-        std::snprintf(line, sizeof(line), "%sresume", cur == 0 ? "> " : "  ");
-        DrawText(menu_px_.data(), kMenuW, 12, 26, line);
-        std::snprintf(line, sizeof(line), "%sfps counter: %s", cur == 1 ? "> " : "  ", rex_nx_show_fps ? "on" : "off");
-        DrawText(menu_px_.data(), kMenuW, 12, 46, line);
-        std::snprintf(line, sizeof(line), "%ssound: %s", cur == 2 ? "> " : "  ", rex_nx_sound ? "on" : "off");
-        DrawText(menu_px_.data(), kMenuW, 12, 66, line);
-        std::snprintf(line, sizeof(line), "%soverlay: %s", cur == 3 ? "> " : "  ", rex_nx_overlay ? "on" : "off");
-        DrawText(menu_px_.data(), kMenuW, 12, 86, line);
-        DrawText(menu_px_.data(), kMenuW, 12, 110, "a ok   b back");
+        auto row = [&](int i, const char* name, const char* val) {
+          std::snprintf(line, sizeof(line), "%s%s%s%s", cur == i ? "> " : "  ", name, val ? ": " : "", val ? val : "");
+          DrawText(menu_px_.data(), kMenuW, 12, 26 + 20 * i, line);
+        };
+        auto onoff = [](int v) { return v ? "on" : "off"; };
+        if (rex_nx_menu_page == 0) {
+          DrawText(menu_px_.data(), kMenuW, 12, 6, "settings");
+          row(0, "resume", nullptr);
+          row(1, "fps counter", onoff(rex_nx_show_fps));
+          row(2, "sound", onoff(rex_nx_sound));
+          row(3, "overlay", onoff(rex_nx_overlay));
+          row(4, "hatching", onoff(rex_nx_hatching));
+          row(5, "sprite mods", onoff(rex_nx_sprite_mods));
+          row(6, "cheats", nullptr);
+        } else {
+          DrawText(menu_px_.data(), kMenuW, 12, 6, "cheats");
+          row(0, "invincible", onoff(rex_nx_cheat_invincible));
+          row(1, "magic", onoff(rex_nx_cheat_mp));
+          row(2, "continues", onoff(rex_nx_cheat_continues));
+          row(3, "attributes", onoff(rex_nx_cheat_attributes));
+          row(4, "start level", rex_nx_level_name(rex_nx_start_level));
+          row(5, "apply", nullptr);
+          row(6, "back", nullptr);
+        }
+        DrawText(menu_px_.data(), kMenuW, 12, 170, "a ok   b back");
         const uint32_t bytes = kMenuW * kMenuH * 4;
         const uint32_t off = f.staging.Alloc(bytes, 0x100);
         if (off != UINT32_MAX) {
@@ -1132,7 +1305,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       dkCmdBufBindVtxBufferState(cmd, nullptr, 0);
       uint32_t dslot = DescriptorFor(f, front, 0);
       if (dslot != UINT32_MAX) {
-        DkResHandle handle = dkMakeTextureHandle(dslot, 4);  // linear, clamp
+        DkResHandle handle = dkMakeTextureHandle(dslot, 16);  // linear, clamp
         dkCmdBufBindTextures(cmd, DkStage_Fragment, 0, &handle, 1);
         dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
       }
@@ -1223,7 +1396,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (f.fenced) {
       if (swaps_ < 6) Log("frame %u: waiting for its fence", frame_);
       DkResult r = dkFenceWait(&f.fence, 2000000000ll);  // 2 s: a hang is logged, not silent
-      if (r != DkResult_Success) Log("frame %u: fence wait result %d (GPU hang?)", frame_, int(r));
+      if (r != DkResult_Success) {
+        Log("frame %u: fence wait result %d (GPU hang?), swap %u, %u images, %zu free, %zu pending", frame_, int(r), swaps_, image_count_,
+            free_images_.size(), pending_free_[0].size() + pending_free_[1].size());
+        DumpImageEvents();
+      }
+      free_images_.insert(free_images_.end(), pending_free_[frame_].begin(), pending_free_[frame_].end());
+      pending_free_[frame_].clear();
       if (swaps_ < 6) Log("frame %u: fence done", frame_);
       f.fenced = false;
     }
@@ -1275,9 +1454,28 @@ class Deko3dCommandProcessor : public CommandProcessor {
   // ----- images ---------------------------------------------------------------------------------
   // gh: images replaced by a resize (or a format change) wait here for a request of the same shape: the
   // pool is a bump allocator and a per-frame resize ping-pong filled 448 MB in minutes (finding 0.22).
+  // The old image may still be sampled or copied by a command buffer that has not run yet (this frame or the
+  // other one in flight): it is reusable only after this frame slot's fence (BeginFrame). 0.85 froze in level 3
+  // right after a resize 576x192 -> 64x160 (gh_log line 15817); reusing at once was the one unfenced hazard.
   std::vector<HostImage*> free_images_;
+  std::vector<HostImage*> pending_free_[kFrames];
   void RecycleImage(HostImage* img) {
-    if (img && !img->is_depth) free_images_.push_back(img);
+    if (img && !img->is_depth) pending_free_[frame_].push_back(img);
+  }
+
+  // The last image events, written to the log when a fence wait times out.
+  struct ImageEvent { char text[96]; };
+  ImageEvent events_[32];
+  uint32_t event_count_ = 0;
+  void NoteImage(const char* fmt, ...) __attribute__((format(printf, 2, 3))) {
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(events_[event_count_++ % 32].text, sizeof(ImageEvent::text), fmt, ap);
+    va_end(ap);
+  }
+  void DumpImageEvents() {
+    const uint32_t n = event_count_ < 32 ? event_count_ : 32;
+    for (uint32_t i = 0; i < n; i++) Log("last image event -%u: %s", n - i, events_[(event_count_ - n + i) % 32].text);
   }
 
   HostImage* CreateImage(uint32_t width, uint32_t height, DkImageFormat format, uint32_t flags, bool is_depth) {
@@ -1308,11 +1506,36 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t align = dkImageLayoutGetAlignment(&img->layout);
     uint32_t off = images_.Alloc(uint32_t(size), align);
     if (off == UINT32_MAX) {
+      // gh: pool full: take the smallest recycled slot that fits (a recycled image is idle; its shape differs).
+      size_t best = free_images_.size();
+      for (size_t i = 0; i < free_images_.size(); i++) {
+        HostImage* r = free_images_[i];
+        if (r->pool_size >= size && r->pool_align % align == 0 &&
+            (best == free_images_.size() || r->pool_size < free_images_[best]->pool_size)) best = i;
+      }
+      if (best != free_images_.size()) {
+        HostImage* r = free_images_[best];
+        free_images_.erase(free_images_.begin() + best);
+        r->layout = img->layout;
+        dkImageInitialize(&r->image, &r->layout, images_.block, r->pool_off);
+        // The descriptor cache keys on the image pointer: drop this frame's entries for the old shape.
+        for (auto it = frames_[frame_].descriptors.begin(); it != frames_[frame_].descriptors.end();) {
+          if ((it->first & 0xFFFFFFFFFFFFull) == uint64_t(reinterpret_cast<uintptr_t>(r))) it = frames_[frame_].descriptors.erase(it);
+          else ++it;
+        }
+        r->flags = flags; r->format = format; r->width = width; r->height = height; r->is_depth = is_depth;
+        r->from_resolve = false; r->content_serial = r->checked_serial = 0; r->guest_base = 0;
+        r->edram_base = r->edram_pitch = 0; r->mod = nullptr;
+        delete img;
+        Log("image pool full: %ux%u placed in a recycled slot", width, height);
+        return r;
+      }
       Log("image pool full (%u MB used): %ux%u not created", images_.used >> 20, width, height);
       delete img;
       return nullptr;
     }
     dkImageInitialize(&img->image, &img->layout, images_.block, off);
+    img->pool_off = off; img->pool_size = uint32_t(size); img->pool_align = align;
     img->format = format;
     img->width = width;
     img->height = height;
@@ -1375,12 +1598,17 @@ class Deko3dCommandProcessor : public CommandProcessor {
         fresh->guest_base = base;
         Log("image at %08X recreated: format %u -> %u, %ux%u -> %ux%u", base, uint32_t(img->format), uint32_t(format), img->width,
             img->height, fresh->width, fresh->height);
+        NoteImage("frame %u recreated %08X fmt %u->%u %ux%u->%ux%u", frame_, base, uint32_t(img->format), uint32_t(format), img->width,
+                  img->height, fresh->width, fresh->height);
         it->second = fresh;
         RecycleImage(img);
         return fresh;
       }
       if (img->width == width && img->height == height) return img;
       if (at_least && width <= img->width && height <= img->height) return img;
+      // gh: a resolve rect is a multiple of 8 (320x184) but the texture fetch is exact (320x180): growing here made the
+      // image ping-pong between the two sizes (a new image and a copy, several times per frame). The resolve clips instead.
+      if (at_least && width <= img->width + 7 && height <= img->height + 7) return img;
       if (at_least) {
         width = std::max(width, img->width);
         height = std::max(height, img->height);
@@ -1400,6 +1628,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
       resized->checked_serial = img->checked_serial;
       resized->guest_base = base;
       Log("image at %08X resized %ux%u -> %ux%u", base, img->width, img->height, width, height);
+      NoteImage("frame %u resized %08X %ux%u->%ux%u (%s)", frame_, base, img->width, img->height, width, height,
+                resized == img ? "same" : "new object");
       it->second = resized;
       RecycleImage(img);  // gh: its pool memory is reused by the next request of its size
       return resized;
@@ -1415,7 +1645,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
   HostImage* TextureImage(Frame& f, const TextureInfo& info, const xenos::xe_gpu_texture_fetch_t& fetch) {
     DkImageFormat format;
     if (!TextureFormatOf(info.format, format)) {
-      LogOnce("tfmt", "unsupported texture format %s", info.format_info()->name);
+      LogOnce((std::string("tfmt ") + info.format_info()->name).c_str(), "unsupported texture format %s %ux%u at %08X: the draw keeps whatever was bound (stale)",
+              info.format_info()->name, info.width + 1, info.height + 1, info.memory.base_address);
       return nullptr;
     }
     uint32_t base = info.memory.base_address;
@@ -1425,7 +1656,21 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (img->checked_serial == serial_) return img;  // already checked for this draw
     img->checked_serial = serial_;
     // Never filled, or written by the guest (or a file read) after the upload / resolve that filled it.
-    if (img->content_serial && !WrittenSince(base, info.memory.base_size, img->content_serial)) return img;
+    uint32_t extent = info.memory.base_size;
+    if (info.is_tiled) {
+      const FormatInfo* fi = info.format_info();
+      const uint32_t bw = (info.width + fi->block_width) / fi->block_width, bh = (info.height + fi->block_height) / fi->block_height;  // size minus one in the fetch
+      extent = std::max(extent, gh_tex::TiledExtentBytes(bw, bh, GuestPitchBlocks(info.pitch, fi->block_width), fi->bytes_per_block()));
+    }
+    // gh: a palette is 1 KB: its guest bytes are compared at every bind, so a write the dirty bytes missed (a host write,
+    // a store form without a mark) cannot leave a stale palette. Larger textures trust the dirty bytes.
+    const bool small = extent <= 4096 && !img->from_resolve;
+    const uint64_t hash = small ? ::gh::SpriteHash(memory_->TranslatePhysical(base), extent) : 0;
+    if (img->content_serial && !WrittenSince(base, extent, img->content_serial)) {
+      if (!small || hash == img->content_hash) return img;
+      if (unmarked_changes_++ < 20) Log("texture at %08X (%ux%u) changed WITHOUT a dirty mark: uploaded again (a store path does not mark its page)",
+                                        base, info.width + 1, info.height + 1);
+    }
     // A failed re-upload (staging ring full) keeps the previous contents rather than unbinding the slot.
     if (!UploadTexture(f, *img, info, fetch.endianness)) return img->content_serial ? img : nullptr;
     if (img->content_serial) {
@@ -1436,6 +1681,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     img->from_resolve = false;
     img->content_serial = serial_;
+    img->content_hash = hash;
     return img;
   }
 
@@ -1445,21 +1691,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     constexpr size_t kTopBytes = size_t(75) * kAtlasW * 2;
     if (name == "k_4_4_4_4" && w == kAtlasW && h == kAtlasH) {
       atlas_top_.assign(staged, staged + kTopBytes);
-      if (SwapAtlasGlyphs(staged)) Log("button glyphs: A<->B and X<->Y swapped in the UI font atlas");
+      if (SwapAtlasGlyphs(staged)) Log("button glyphs: X<->Y swapped in the UI font atlas (A and B follow the name mapping)");
       else LogOnce("glyphs-atlas", "button glyphs: the UI font atlas does not look as expected, left alone");
-    } else if (name == "k_8_8_8_8" && w == 288 && h == 96) {
-      if (atlas_top_.empty()) {
-        // The atlas is not uploaded yet (the title comes first): read its top rows from guest memory, where
-        // every run so far has it (validated by the colours below).
-        const uint8_t* g = memory_->TranslatePhysical(kAtlasPhysical);
-        if (g) {
-          atlas_top_.resize(kTopBytes);
-          for (size_t i = 0; i < kTopBytes; i += 2) { atlas_top_[i] = g[i + 1]; atlas_top_[i + 1] = g[i]; }
-        }
-      }
-      if (!atlas_top_.empty() && AtlasCellIs(atlas_top_.data(), 1) && ReplaceTitleGlyph(staged, atlas_top_.data()))
-        Log("button glyphs: the A disc of PRESS A BUTTON replaced by B");
-      else LogOnce("glyphs-title", "button glyphs: no B icon available for the title, left alone");
     }
   }
 
@@ -1481,6 +1714,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   // gh: copies tightly packed texels into an image (the replacement sprites).
+  // gh: a 256x1 image of zeros, made once: the hatch mask while hatching is off. nullptr when it did not fit this time.
+  HostImage* NoHatchImage(Frame& f) {
+    if (!no_hatch_) no_hatch_ = CreateImage(256, 1, DkImageFormat_RGBA8_Unorm, DkImageFlags_UsageRender, false);
+    static const uint8_t zero[1024] = {};
+    if (no_hatch_ && !no_hatch_ready_) no_hatch_ready_ = UploadRaw(f, *no_hatch_, zero, sizeof(zero), 256, 1);
+    return no_hatch_ready_ ? no_hatch_ : nullptr;
+  }
+
   bool UploadRaw(Frame& f, HostImage& img, const uint8_t* data, uint32_t bytes, uint32_t w, uint32_t h) {
     uint32_t off = f.staging.Alloc(bytes, 0x100);
     if (off == UINT32_MAX) { LogOnce("staging", "staging ring full: %u KB texture not uploaded", bytes >> 10); return false; }
@@ -1523,6 +1764,70 @@ class Deko3dCommandProcessor : public CommandProcessor {
     return true;
   }
 
+  // gh: the RGBA8 image of a true-colour replacement (mods/textures/), created and uploaded once; nullptr when it
+  // did not fit this time (the draw keeps the game's texture and tries again next time).
+  HostImage* ModRgbaImage(Frame& f, ::gh::ModSprite* m) {
+    const uint32_t bytes = m->w * m->h * 4;
+    if (bytes > kStagingBytes) {
+      LogOnce("texmod-big", "texture mod: a %ux%u replacement is larger than the %u MB upload ring, not used", m->w, m->h, kStagingBytes >> 20);
+      return nullptr;
+    }
+    if (!m->index_image) m->index_image = CreateImage(m->w, m->h, DkImageFormat_RGBA8_Unorm, DkImageFlags_UsageRender, false);
+    HostImage* img = static_cast<HostImage*>(m->index_image);
+    if (!img) return nullptr;
+    if (!(m->gpu_state & 1)) {
+      if (!UploadRaw(f, *img, m->rgba.data(), bytes, m->w, m->h)) return nullptr;
+      m->gpu_state |= 1;
+      std::vector<uint8_t>().swap(m->rgba);  // on the GPU now
+    }
+    return img;
+  }
+
+  // gh: diagnostics, the first 40 uploads of an unusual shape: what the staging decode assumes versus the fetch constant.
+  // Look for: "packed 1" (mip tail textures: the base is at an offset the decode ignores), mips, a stride that differs
+  // from the pitch, a texture that is not 2D.
+  void UploadDiag(const FormatInfo* fi, const TextureInfo& info, uint32_t width, uint32_t height) {
+    const uint32_t stride = GuestPitchBlocks(info.pitch, fi->block_width);
+    const bool odd = info.has_packed_mips || info.mip_max_level > 0 || std::min(width, height) <= 16 ||
+                     stride != info.pitch / fi->block_width || info.pitch != ((width + 31) & ~31u) ||
+                     info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked;
+    if (!odd || diag_count_ >= 40) return;
+    diag_count_++;
+    Log("texdiag %s %ux%u %s pitch %u (stride %u blocks) packed %u mips %u..%u dim %u stacked %u base %08X mip %08X endian %u", fi->name, width, height,
+        info.is_tiled ? "tiled" : "linear", info.pitch, stride, info.has_packed_mips, info.mip_min_level, info.mip_max_level, uint32_t(info.dimension),
+        info.is_stacked, info.memory.base_address, info.memory.mip_address, uint32_t(info.endianness));
+  }
+  uint32_t diag_count_ = 0;
+
+  // gh: dump_tex=N: raw guest bytes (the memory behind the fetch constant, before detile and endian swap) and a .txt with the
+  // layout, for tools/decode_texdump.py.
+  uint32_t raw_dump_left_ = 0;
+  std::unordered_set<uint64_t> raw_dumped_;
+  void DumpRaw(const FormatInfo* fi, const TextureInfo& info, uint32_t width, uint32_t height, uint32_t stride, const uint8_t* src,
+               xenos::Endian endian) {
+    if (!raw_dump_left_ || width < 256 || height < 256) return;
+    if (!raw_dumped_.insert((uint64_t(info.memory.base_address) << 24) ^ (uint64_t(width) << 12) ^ height).second) return;
+    raw_dump_left_--;
+    // The tiled extent: rows rounded up to whole 32 block tiles, stride blocks wide.
+    const uint32_t bpb = fi->bytes_per_block();
+    const uint32_t brows = (height + fi->block_height - 1) / fi->block_height;
+    size_t bytes = size_t(stride) * ((brows + 31) & ~31u) * bpb;
+    if (bytes < info.memory.base_size) bytes = info.memory.base_size;
+    if (bytes > (32u << 20)) bytes = 32u << 20;
+    char path[200];
+    std::snprintf(path, sizeof(path), "%stexdump/t%08X_%ux%u_%s", debug_dir_.c_str(), info.memory.base_address, width, height, fi->name);
+    std::string bin = std::string(path) + ".bin", txt = std::string(path) + ".txt";
+    if (FILE* fp = std::fopen(bin.c_str(), "wb")) { std::fwrite(src, 1, bytes, fp); std::fclose(fp); }
+    if (FILE* fp = std::fopen(txt.c_str(), "w")) {
+      std::fprintf(fp, "format %s\nwidth %u\nheight %u\npitch %u\nstride_blocks %u\nblock_width %u\nblock_height %u\nbytes_per_block %u\nendian %u\ntiled %u\n"
+                       "base %08X\nbase_size %u\npacked_mips %u\nmip_max %u\nbin_bytes %zu\n",
+                   fi->name, width, height, info.pitch, stride, fi->block_width, fi->block_height, bpb, uint32_t(endian), info.is_tiled ? 1 : 0,
+                   info.memory.base_address, uint32_t(info.memory.base_size), info.has_packed_mips ? 1 : 0, uint32_t(info.mip_max_level), bytes);
+      std::fclose(fp);
+    }
+    Log("dump_tex: %s %ux%u pitch %u endian %u -> %s (%zu KB)", fi->name, width, height, info.pitch, uint32_t(endian), bin.c_str(), bytes >> 10);
+  }
+
   bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, xenos::Endian endian) {
     const FormatInfo* fi = info.format_info();
     const uint32_t width = info.width + 1, height = info.height + 1;  // TextureInfo keeps size minus one
@@ -1534,23 +1839,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (off == UINT32_MAX) { LogOnce("staging", "staging ring full: %u KB texture not uploaded", bytes >> 10); return false; }
     uint8_t* dst = f.staging.cpu + off;
     const uint8_t* src = memory_->TranslatePhysical(info.memory.base_address);
-    if (info.is_tiled) {
-      texture_conversion::UntileInfo u{};
-      u.offset_x = 0;
-      u.offset_y = 0;
-      u.width = bw;
-      u.height = bh;
-      u.input_pitch = info.pitch / fi->block_width;  // gh: TextureInfo::pitch is in texels; Untile wants blocks (DXT: a quarter)
-      u.output_pitch = bw;
-      u.input_format_info = fi;
-      u.output_format_info = fi;
-      u.copy_callback = [endian](void* o, const void* i, size_t n) { texture_conversion::CopySwapBlock(endian, o, i, n); };
-      texture_conversion::Untile(dst, src, &u);
-    } else {
-      uint32_t row = bw * bpb;
-      uint32_t src_row = (info.pitch / fi->block_width) * bpb;  // gh: pitch in texels -> blocks
-      for (uint32_t y = 0; y < bh; y++) texture_conversion::CopySwapBlock(endian, dst + y * row, src + y * src_row, row);
-    }
+    const uint32_t stride = GuestPitchBlocks(info.pitch, fi->block_width);  // gh: pitch is in texels, the tiles are 32 BLOCKS wide: round up (DXT 608 -> 160, not 152)
+    DumpRaw(fi, info, width, height, stride, src, endian);
+    if (info.is_tiled) gh_tex::DetileBlocks(dst, src, bw, bh, stride, bpb, uint32_t(endian));
+    else gh_tex::CopyLinearBlocks(dst, src, bw, bh, stride, bpb, uint32_t(endian));
     img.mod = nullptr;
     if (sprite_mod_on_ && std::strcmp(fi->name, "k_8") == 0) {
       // gh: 8 bit textures are the sprite frames (indices; the palette is a second texture). Identify by content.
@@ -1566,12 +1858,33 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const std::string id = ::gh::SpriteId(width, height, ::gh::SpriteHash(dst, size_t(width) * height));
       LogOnce(("spriteid " + id).c_str(), "sprite id %s (k_8 texture at %08X)", id.c_str(), info.memory.base_address);
     }
+    const bool true_colour_fmt = std::strcmp(fi->name, "k_8_8_8_8") == 0 || std::strcmp(fi->name, "k_DXT1") == 0 ||
+                                 std::strcmp(fi->name, "k_DXT2_3") == 0 || std::strcmp(fi->name, "k_DXT4_5") == 0;
+    const bool texture_lookup = texture_mod_on_ && true_colour_fmt && texture_mod_.HasSize(width, height);
+    if (texture_lookup || (dump_tex_ && true_colour_fmt)) {
+      // gh: true-colour textures (portraits): the same ids as the sprites, over all staged bytes. Hashed only when a
+      // mod file has this size (or with the dump marker): big textures are uploaded often.
+      const uint64_t hash = ::gh::SpriteHash(dst, bytes);
+      const std::string id = ::gh::SpriteId(width, height, hash);
+      if (dump_tex_) LogOnce(("textureid " + id).c_str(), "texture id %s (%s)", id.c_str(), fi->name);
+      if (texture_lookup) {
+        img.mod = texture_mod_.Find(width, height, hash);
+        const std::string key = "texmod " + id;  // one line per id: replaced, load error or no file
+        if (img.mod) LogOnce(key.c_str(), "texture mod: %s replaced (%ux%u -> %ux%u)", id.c_str(), width, height, img.mod->w, img.mod->h);
+        else if (!texture_mod_.last_error().empty()) LogOnce(key.c_str(), "texture mod: %s", texture_mod_.last_error().c_str());
+        else LogOnce(key.c_str(), "texture mod: no file for %s (%s at %08X)", id.c_str(), fi->name, info.memory.base_address);
+      }
+    }
     if (REXCVAR_GET(button_glyphs) == "switch") PatchGlyphs(fi, dst, width, height);
     if (dump_tex_) DumpTexture(fi, info, dst, width, height);
+    UploadDiag(fi, info, width, height);
     DkCopyBuf cb{f.staging.gpu + off, 0, 0};
     DkImageView view;
     dkImageViewDefaults(&view, &img.image);
     DkImageRect rect{0, 0, 0, width, height, 1};
+    // gh: the copy engine must not overwrite an image that earlier draws (this frame or the one in flight) still sample:
+    // a re-upload in place, a recycled pool slot. One wait per draw is enough (the barrier after each copy covers later copies).
+    if (serial_ != upload_barrier_serial_) { dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, 0); upload_barrier_serial_ = serial_; }
     dkCmdBufCopyBufferToImage(f.cmdbuf, &cb, &view, &rect, 0);
     dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
     uploads_++;
@@ -1762,6 +2075,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!dst) return true;
     dst->from_resolve = true;
     dst->content_serial = serial_;
+    dst->mod = nullptr;  // gh: rendered contents now, not the uploaded texture a mod replaced
     if (x + w > src->width) w = x < src->width ? src->width - x : 0;
     if (y + h > src->height) h = y < src->height ? src->height - y : 0;
     if (dx + w > dst->width) w = dx < dst->width ? dst->width - dx : 0;
@@ -1869,6 +2183,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
   bool dump_tex_ = false;  // gh: marker dk_dump_tex
   ::gh::SpriteMod sprite_mod_;  // gh: replacement sprites from the mod folder
   bool sprite_mod_on_ = false;
+  HostImage* no_hatch_ = nullptr;
+  bool no_hatch_ready_ = false;
+  ::gh::SpriteMod texture_mod_;  // gh: replacement true-colour textures (RGBA, mods/textures/)
+  bool texture_mod_on_ = false;
   std::unordered_set<uint64_t> dumped_tex_;
   std::vector<uint8_t> atlas_top_;  // gh: rows 0..74 of the UI font atlas as staged (little-endian u16), unswapped
   HostImage* overlay_[kFrames] = {};  // gh: the version / fps strip, one image per frame in flight
@@ -1882,6 +2200,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::string shader_dir_;
   std::vector<uint32_t> page_serial_ = std::vector<uint32_t>(0x20000);  // per 4 KB physical page: the draw serial of its last write
   uint32_t serial_ = 1;  // the draw serial (SyncDirtyPages)
+  uint32_t upload_barrier_serial_ = 0;  // gh: the draw serial of the last wait before a texture copy
   uint64_t dirty_pages_ = 0, dirty_pages_at_swap_ = 0;
   std::unordered_map<uint64_t, DkShaderObj*> shaders_;
   std::unordered_map<uint64_t, HostImage*> targets_;       // EDRAM base/pitch -> render target
@@ -1891,6 +2210,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
   std::unordered_set<std::string> logged_;
   uint32_t swaps_ = 0, draws_ = 0, skipped_ = 0, missing_draws_ = 0, missing_shaders_ = 0, clears_ = 0, resolves_ = 0;
   uint32_t image_count_ = 0, uploads_ = 0, reuploads_ = 0;
+  uint32_t sprdiag_files_ = 0;
+  uint32_t unmarked_changes_ = 0, sprdiag_lines_ = 0;  // gh: the small-texture hash check and the sprite diagnostics
+  std::unordered_map<uint32_t, std::pair<uint64_t, uint32_t>> sprdiag_;  // per mask texture: the last state hash, lines written
   uint64_t upload_bytes_ = 0;
   uint32_t frame_draws_ = 0, frame_clears_ = 0, frame_resolves_ = 0, frame_skipped_ = 0, frame_missing_ = 0, frame_reuploads_ = 0;
 };

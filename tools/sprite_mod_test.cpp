@@ -31,6 +31,17 @@ int main(int argc, char** argv) {
     std::printf(" err=[%s]\n", m.last_error().c_str());
     return 0;
   }
+  if (!std::strcmp(argv[1], "tfind") && argc > 5) {  // tfind <dir> <w> <h> <hash hex>: the true-colour store
+    gh::SpriteMod m;
+    size_t n = m.Init(argv[2], true);
+    uint32_t w = uint32_t(std::atoi(argv[3])), h = uint32_t(std::atoi(argv[4]));
+    gh::ModSprite* s = m.Find(w, h, std::strtoull(argv[5], nullptr, 16));
+    std::printf("files %zu size %d other %d found %d", n, m.HasSize(w, h) ? 1 : 0, m.HasSize(w + 1, h) ? 1 : 0, s ? 1 : 0);
+    if (s) std::printf(" %ux%u tc=%d idx=%zu rgba=%016llx", s->w, s->h, s->true_colour ? 1 : 0, s->index.size(),
+                       (unsigned long long)gh::SpriteHash(s->rgba.data(), s->rgba.size()));
+    std::printf(" err=[%s]\n", m.last_error().c_str());
+    return 0;
+  }
   auto file = Read(argv[2]);
   if (!std::strcmp(argv[1], "hash")) {
     std::printf("%016llx\n", (unsigned long long)gh::SpriteHash(file.data(), file.size()));

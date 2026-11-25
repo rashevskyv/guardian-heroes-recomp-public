@@ -35,24 +35,79 @@ The recompiled code matches the retail `default.xex` of the 2011 release only (3
 3. Start **Guardian Heroes** from the homebrew menu. Use title takeover: hold **R** while you start any game.
    Applet mode is not tested.
 
-Buttons follow the Xbox layout by position (Switch B = Xbox A). The on-screen button icons show Switch letters.
+Buttons follow the Switch letters: Switch A = the game's accept (Xbox A), Switch B = cancel (Xbox B). Y and X stay positional (Switch Y, west = Xbox X; Switch X, north = Xbox Y). The on-screen icons show the same letters: A and B as the game draws them, X and Y swapped. In the menu: A = ok, B = back.
+
+| Switch | Game action (Xbox name) |
+| --- | --- |
+| A (east) | A: accept / attack |
+| B (south) | B: cancel / special |
+| Y (west) | X |
+| X (north) | Y |
+| L / R | left / right shoulder |
+| ZL / ZR | triggers |
 
 | Switch | Action |
 | --- | --- |
-| **+** and **−** together | Open the small settings menu: resume, fps counter, sound, overlay (each on or off, saved in `sdmc:/switch/gh/settings.txt`) |
+| **L3 and R3** together (hold 0.15 s, any order) or **+** and **−** together | Open the small settings menu: resume, fps counter, sound, overlay, hatching, sprite mods, cheats (a submenu; saved in `sdmc:/switch/gh/settings.txt`) |
+| **D-pad up/down** | Move in the menu |
+| **D-pad left/right** | Change the value of the line: left = previous, right = next (wraps around; held, it repeats after 0.4 s). The A button works as "next" and opens the `cheats` line. The B button goes back |
 | **+** | Start |
 | **−** | Back (skips cut scenes) |
 
 The version `0.<count>.<sha>` shows at the bottom-left of the screen and in the app list. Logs are in
-`sdmc:/switch/gh/gh_log.txt` and `gh_rex_log.txt`. The menu item "overlay" hides the strip; an empty file `sdmc:/switch/gh/overlay_off` does the same.
+`sdmc:/switch/gh/gh_log.txt` and `gh_rex_log.txt`. The menu item "overlay" hides the version; the fps counter is a separate item and still shows (alone) when the overlay is off; an empty file `sdmc:/switch/gh/overlay_off` does the same.
+
+The menu item "hatching" (`hatching=0|1` in `settings.txt`, default 1) switches the pencil hatching on the character sprites off or on.
+The item "sprite mods" (`sprite_mods=0|1`, default 1) draws the PNG replacements from `sdmc:/switch/gh/mods/sprites/`, or the game's own sprites when off. Both work at once, without a restart.
+
+Level select (Switch): in the submenu `cheats`, the item `start level` steps (left or right) through off, 1-1, 1-2, 1-3, 2-1, ... 18-2 (the game's own stage names).
+The chosen level is used when you pick `Story > Continue` or start a new story game: the story-entry code reads the stage byte, and the game replaces it in memory by `start_level` (log: `[gh] continue: stage A -> B`). The save file on disk is not changed, but a later autosave may store the chosen stage, so Continue then plays that stage. Set the level to `off` to play normally.
+The line `apply` (A button) closes the menu and jumps to the chosen stage at once, without leaving the game: it runs the same steps as Story > New game (clear the game state, store the stage, request the game's mode state 8) from the game thread. This is experimental: it resets the story progress like a new game, the screen you get may be the stage-intro menu, and it has not been proven for every game state. The log shows `[gh] apply ...` and `[gh] mode state A -> B`. If it fails, quit and use Story > Continue or New game (the start level is applied there).
+It is saved as `start_level=<0..40>` in `settings.txt` (0 = normal flow) and applies when a new story game starts.
+The log shows `[gh] new game: stage byte A -> B` and `[gh] stage load: index N`.
 
 Create an empty file `sdmc:/switch/gh/mute` to start with the sound off.
+
+### Automatic clocks (Switch)
+
+The game raises the CPU and GPU clocks by itself and lowers them again when it has headroom (a governor, adapted from the Hard Corps: Uprising port). Keys in `sdmc:/switch/gh/settings.txt` (MHz; the pad menu keeps them when it saves):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `auto_clock` | `1` | `1` = governor; `0` = fixed at the maximum (the old behaviour) |
+| `clock_max_cpu` | `1785` | CPU limit; a smaller value snaps down to a table rate (1020 ... 1785) |
+| `clock_max_gpu` | `768` | GPU limit (307.2 ... 768) |
+| `clock_max_mem` | `1600` | Memory clock, set once (1331 or 1600) |
+
+The limits can only go down: a larger value is cut to the defaults, which are the old fixed clocks. The governor counts the game's frames every 0.1 s over the last second. It goes up one rung at once at 3 or more lost frames (two rungs at 6 or more). It goes down one rung after 5 checks of 2 s with under 1 lost frame. A failed step down doubles that wait (up to 64). A second with fewer than 30 frames (a load, a menu) keeps the rung. There is one ladder for handheld (CPU 1224 / GPU 384 up to 1785 / 768) and one for docked (CPU 1428 up to 1785, GPU 768). The ladders are not measured on the console yet. If sys-clk or Horizon OC runs, the game leaves the clocks alone. The old clocks come back on exit and after a crash. Log lines start with `[clock]`.
 
 ### Sprite mods (Switch)
 
 Put PNG files in `sdmc:/switch/gh/mods/sprites/` to replace the character sprites of the Remix mode. The file name ends with
 `__<id>.png`; the id comes from `tools/spritemod.py export-all` (it reads your own game files). An indexed PNG that keeps the
 game's palette also keeps the costume colours. Tools: `tools/spritemod.py`, `tools/palettize.py`. Step by step: [docs/SPRITE-REPLACEMENT.md](docs/SPRITE-REPLACEMENT.md).
+
+## Cheats
+
+Four cheats, all off by default: `cheat_invincible` (player health stays full), `cheat_mp` (magic stays full),
+`cheat_continues` (99 continues) and `cheat_attributes` (all six attributes at the game's cap).
+
+- PC (Linux, Windows): tick them in the settings window, tab **Cheats**, and press "Save to gh.toml". They also work as
+  `cheat_invincible = true` in `gh.toml` or as `--cheat_invincible=true` on the command line.
+- Switch: press + and - together to open the settings menu and pick `cheats`. The submenu has `invincible`,
+  `magic`, `continues`, `attributes`, `start level`, `apply` and `back`. Move with D-pad up/down, switch with D-pad left/right or the A button (the right
+  button). They work at once and are saved in `sdmc:/switch/gh/settings.txt` with the other menu items.
+  You can also write the keys by hand, in `settings.txt` or in `sdmc:/switch/gh/cheats.txt` (read first; `settings.txt`
+  wins), then start the game:
+
+```
+invincible=1
+mp=1
+continues=1
+attributes=1
+```
+
+The cheats act on human players only.
 
 ## Linux
 

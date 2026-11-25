@@ -19,6 +19,10 @@ BUILD=$SRC/out/build/switch
 
 mkdir -p "$SRC"
 rsync -a --delete --exclude /out --exclude /game --exclude /generated/default --exclude /.git "$GIT_DIR/" "$SRC/"
+# The icon is git-ignored game art: a checkout without it (worktree, clean clone) built an NRO with the default "?" icon.
+# $ROOT/icon/gh_icon.jpg is the backup outside git; no icon at all stops the build (GH_NO_ICON=1 to allow it).
+[ -f "$SRC/switch/icon/gh_icon.jpg" ] || { mkdir -p "$SRC/switch/icon"; cp "$ROOT/icon/gh_icon.jpg" "$SRC/switch/icon/" 2>/dev/null || true; }
+[ -f "$SRC/switch/icon/gh_icon.jpg" ] || [ -n "${GH_NO_ICON:-}" ] || { echo "no icon: switch/icon/gh_icon.jpg (256x256 JPEG, also kept at $ROOT/icon/)"; exit 1; }
 [ -f "$NVK_SDK/lib/libvulkan.a" ] || { echo "no NVK: $NVK_SDK/lib/libvulkan.a (cbfd-switch switch/build-nvk.sh)"; exit 1; }
 [ -f "$SRC/generated/default/sources.cmake" ] || { echo "no codegen output: run the Linux build first"; exit 1; }
 

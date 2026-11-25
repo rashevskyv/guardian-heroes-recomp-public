@@ -8,15 +8,39 @@
 #include <rex/input/flags.h>
 #include <rex/logging.h>
 
+#include "../../../src/cheats_config.h"  // gh: GhCheatFlags, GhCheatParseLine, GhCheatFormat
+
 // gh: the settings menu drawn by the deko3d backend (src/gpu/deko3d_backend.cpp) reads these.
 extern "C" {
 volatile int rex_nx_menu_open = 0;    // 1 while the menu is up: the game sees a neutral pad
-volatile int rex_nx_menu_cursor = 0;  // 0 resume, 1 fps counter, 2 sound, 3 overlay
+volatile int rex_nx_menu_cursor = 0;  // main page: 0 resume, 1 fps, 2 sound, 3 overlay, 4 hatching, 5 sprite mods, 6 cheats; cheats page: 0-3 cheats, 4 start level, 5 apply, 6 back
+volatile int rex_nx_menu_page = 0;    // 0 main, 1 cheats
 volatile int rex_nx_show_fps = 1;     // the fps number in the on-screen strip
 volatile int rex_nx_sound = 1;       // the audio output (audout driver, src/nx_audout_driver.h) plays; 0 = silence
 volatile int rex_nx_overlay = 1;     // the on-screen strip (version + fps) is drawn; 0 = hidden
+volatile int rex_nx_hatching = 1;     // the pencil hatching on the sprites (deko3d backend); 0 = off
+volatile int rex_nx_sprite_mods = 1;  // the PNG replacements of mods/sprites/ are drawn (deko3d backend); 0 = the game's sprites
+// The cheats (src/cheats.cpp reads them live).
+volatile int rex_nx_cheat_invincible = 0;
+volatile int rex_nx_cheat_mp = 0;
+volatile int rex_nx_cheat_continues = 0;
+volatile int rex_nx_cheat_attributes = 0;
+// 0 = the normal story flow; 1..40 = a new story game starts at stage name list entry n-1 (src/cheats.cpp).
+volatile int rex_nx_start_level = 0;
+extern volatile int rex_nx_auto_clock, rex_nx_clock_max_cpu, rex_nx_clock_max_gpu, rex_nx_clock_max_mem;  // switch_nx.cpp
+volatile int rex_nx_apply_level = 0;  // Apply pressed: 1..40, the game thread takes it (src/cheats.cpp) and sets it back to 0
+// The game's own stage names (string table at guest 0x82914668, indexed by the stage byte at game state +0x3AF).
+const char* rex_nx_level_name(int n) {
+  static const char* const names[] = {"1-1", "1-2", "1-3", "2-1", "3-1", "3-vs", "3-2", "4-1", "4-2", "4-3", "5-1", "5-vs",
+                                      "5-2", "6-1", "6-2", "7-1", "7-2", "8-1", "8-2", "9-1", "9-2", "9-3", "10-1", "10-2",
+                                      "10-3", "11-1", "11-2", "12-1", "12-vs", "12-2", "13-1", "14-1", "15-1", "15-2",
+                                      "15-3", "16-1", "16-2", "17-1", "18-1", "18-2"};
+  return n >= 1 && n <= 40 ? names[n - 1] : "off";
+}
 
-// The three settings live in sdmc:/switch/gh/settings.txt ("fps=1", "sound=1", "overlay=1", one per line). The
+// The settings live in sdmc:/switch/gh/settings.txt ("fps=1", "sound=1", "overlay=1", and the cheat keys
+// "invincible=", "mp=", "continues=", "attributes=", one per line). A hand-made cheats.txt in the same folder is
+// read first (settings.txt wins). The
 // file is read once, by whoever asks first (the pad driver or the deko3d backend), and written on every change
 // in the menu. The marker files overlay_off and mute (src/nx_audout_driver.h) still force a start with that
 // setting off.
@@ -26,25 +50,54 @@ static bool g_settings_loaded = false;
 void rex_nx_load_settings(void) {
   if (g_settings_loaded) return;
   g_settings_loaded = true;
+  GhCheatFlags cheats;
+  if (FILE* fp = std::fopen("sdmc:/switch/gh/cheats.txt", "r")) {
+    char line[64];
+    while (std::fgets(line, sizeof(line), fp)) GhCheatParseLine(line, cheats);
+    std::fclose(fp);
+  }
   if (FILE* fp = std::fopen(kSettingsPath, "r")) {
     char line[64];
     while (std::fgets(line, sizeof(line), fp)) {
+      GhCheatParseLine(line, cheats);
       int v = 0;
       if (std::sscanf(line, "fps=%d", &v) == 1) rex_nx_show_fps = v != 0;
       else if (std::sscanf(line, "sound=%d", &v) == 1) rex_nx_sound = v != 0;
       else if (std::sscanf(line, "overlay=%d", &v) == 1) rex_nx_overlay = v != 0;
+      else if (std::sscanf(line, "hatching=%d", &v) == 1) rex_nx_hatching = v != 0;
+      else if (std::sscanf(line, "sprite_mods=%d", &v) == 1) rex_nx_sprite_mods = v != 0;
+      else if (std::sscanf(line, "start_level=%d", &v) == 1) rex_nx_start_level = v >= 1 && v <= 40 ? v : 0;
     }
     std::fclose(fp);
   }
+  rex_nx_cheat_invincible = cheats.invincible;
+  rex_nx_cheat_mp = cheats.mp;
+  rex_nx_cheat_continues = cheats.continues;
+  rex_nx_cheat_attributes = cheats.attributes;
   if (access("sdmc:/switch/gh/overlay_off", F_OK) == 0) rex_nx_overlay = 0;
-  std::printf("[nx] settings: fps %d, sound %d, overlay %d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay);
+  std::printf("[nx] settings: fps %d, sound %d, overlay %d, cheats %d%d%d%d\n", rex_nx_show_fps, rex_nx_sound,
+              rex_nx_overlay, rex_nx_cheat_invincible, rex_nx_cheat_mp, rex_nx_cheat_continues,
+              rex_nx_cheat_attributes);
   std::fflush(stdout);
 }
 
 void rex_nx_save_settings(void) {
   FILE* fp = std::fopen(kSettingsPath, "w");
   if (!fp) return;
-  std::fprintf(fp, "fps=%d\nsound=%d\noverlay=%d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay);
+  std::fprintf(fp, "fps=%d\nsound=%d\noverlay=%d\nstart_level=%d\n", rex_nx_show_fps, rex_nx_sound, rex_nx_overlay,
+               rex_nx_start_level);
+  std::fprintf(fp, "hatching=%d\nsprite_mods=%d\n", rex_nx_hatching, rex_nx_sprite_mods);
+  // The clock keys (switch_nx.cpp reads them at start): kept, so a menu save does not drop them.
+  std::fprintf(fp, "auto_clock=%d\nclock_max_cpu=%d\nclock_max_gpu=%d\nclock_max_mem=%d\n", rex_nx_auto_clock,
+               rex_nx_clock_max_cpu, rex_nx_clock_max_gpu, rex_nx_clock_max_mem);
+  GhCheatFlags cheats;
+  cheats.invincible = rex_nx_cheat_invincible != 0;
+  cheats.mp = rex_nx_cheat_mp != 0;
+  cheats.continues = rex_nx_cheat_continues != 0;
+  cheats.attributes = rex_nx_cheat_attributes != 0;
+  char text[96];
+  GhCheatFormat(cheats, text, sizeof(text));
+  std::fputs(text, fp);
   std::fclose(fp);
 }
 }
@@ -53,21 +106,63 @@ namespace rex::input::nx {
 
 namespace {
 
-constexpr int kMenuItems = 4;
+constexpr int kMainItems = 7, kCheatItems = 7;  // main page: resume, fps, sound, overlay, hatching, sprite mods, cheats; cheats page: 4 cheats, start level, apply, back
+constexpr uint64_t kRepeatDelayNs = 400000000ull, kRepeatNs = 120000000ull;  // D-pad left/right repeat
+constexpr uint64_t kStickHoldNs = 150000000ull;   // L3 + R3 must be held together this long (any order)
+constexpr uint64_t kPartialLogNs = 400000000ull;  // one thumb alone this long is logged once
 bool g_combo_prev = false;
+uint64_t g_sticks_since = 0, g_one_stick_since = 0;
+bool g_partial_logged = false;
+int g_menu_open_logged = 0;
+bool g_menu_via_sticks = false;
 bool g_neutral = false;  // neutral pad for the game until every button is released
+int g_rep_dir = 0;
+uint64_t g_rep_next = 0;
+bool g_menu_dirty = false;  // a value changed and is not saved yet
 uint16_t g_prev_all = 0;
+
+// One menu action on the current item. dir = -1 (left, previous) or +1 (right, next); confirm = the A button.
+// Switches flip on left, right and confirm; start level steps by dir and wraps 0..40 (0 = off); resume, cheats and
+// back act on confirm only. Returns true when a value changed (the caller saves).
+bool MenuChange(int dir, bool confirm) {
+  volatile int& c = rex_nx_menu_cursor;
+  auto flip = [](volatile int& v) { v = !v; return true; };
+  if (rex_nx_menu_page == 0) {
+    if (c == 0) { if (confirm) rex_nx_menu_open = 0; return false; }
+    if (c == 1) return flip(rex_nx_show_fps);
+    if (c == 2) return flip(rex_nx_sound);
+    if (c == 3) return flip(rex_nx_overlay);
+    if (c == 4) return flip(rex_nx_hatching);
+    if (c == 5) return flip(rex_nx_sprite_mods);
+    if (confirm) { rex_nx_menu_page = 1; c = 0; }  // cheats
+    return false;
+  }
+  if (c == 0) return flip(rex_nx_cheat_invincible);
+  if (c == 1) return flip(rex_nx_cheat_mp);
+  if (c == 2) return flip(rex_nx_cheat_continues);
+  if (c == 3) return flip(rex_nx_cheat_attributes);
+  if (c == 4) {
+    rex_nx_start_level = (rex_nx_start_level + dir + 41) % 41;
+    return true;
+  }
+  if (c == 5) {  // apply: the game thread writes the stage byte (src/cheats.cpp)
+    if (confirm && rex_nx_start_level) { rex_nx_apply_level = rex_nx_start_level; rex_nx_menu_open = 0; }
+    return false;
+  }
+  if (confirm) { rex_nx_menu_page = 0; c = 6; }  // back
+  return false;
+}
 
 constexpr DeviceId kPad = static_cast<DeviceId>(0x4E580000);  // "NX"
 
-// Positional mapping: the Switch's B/A/Y/X sit where the 360's A/B/X/Y sit.
+// Switch A (east) = Xbox A (accept), Switch B (south) = Xbox B (cancel). Y/X stay positional (west = Xbox X, north = Xbox Y).
 struct ButtonMap {
   uint64_t nx;
   uint16_t x360;
 };
 constexpr ButtonMap kButtons[] = {
-    {HidNpadButton_B, X_INPUT_GAMEPAD_A},
-    {HidNpadButton_A, X_INPUT_GAMEPAD_B},
+    {HidNpadButton_A, X_INPUT_GAMEPAD_A},
+    {HidNpadButton_B, X_INPUT_GAMEPAD_B},
     {HidNpadButton_Y, X_INPUT_GAMEPAD_X},
     {HidNpadButton_X, X_INPUT_GAMEPAD_Y},
     {HidNpadButton_Plus, X_INPUT_GAMEPAD_START},
@@ -221,33 +316,84 @@ X_RESULT NXInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     uint16_t all = buttons | scheduled;
     bool neutral_now = false;
     {
-      // gh: + and - together (Start and Back) open and close the settings menu; each alone goes to the game.
-      // While the menu is up, and until all buttons are released after it, the game gets a neutral pad.
-      const bool combo = (all & X_INPUT_GAMEPAD_START) && (all & X_INPUT_GAMEPAD_BACK);
+      // gh: L3 + R3 held together for 150 ms (any order), or + and - together (Start and Back), open and close the
+      // settings menu; each button alone goes to the game. While the menu is up, and until all buttons are released
+      // after it, the game gets a neutral pad.
+      const uint64_t now_tick = armGetSystemTick();
+      const bool l3 = all & X_INPUT_GAMEPAD_LEFT_THUMB, r3 = all & X_INPUT_GAMEPAD_RIGHT_THUMB;
+      if (l3 && r3) {
+        if (!g_sticks_since) g_sticks_since = now_tick;
+      } else {
+        g_sticks_since = 0;
+      }
+      if (l3 != r3) {
+        if (!g_one_stick_since) g_one_stick_since = now_tick;
+        if (!g_partial_logged && armTicksToNs(now_tick - g_one_stick_since) >= kPartialLogNs) {
+          g_partial_logged = true;
+          std::printf("[nx] menu: only %s is held; the menu needs L3 and R3 together (150 ms) or + and - together\n",
+                      l3 ? "L3" : "R3");
+          std::fflush(stdout);
+        }
+      } else {
+        g_one_stick_since = 0;
+      }
+      const bool start_back = (all & X_INPUT_GAMEPAD_START) && (all & X_INPUT_GAMEPAD_BACK);
+      const bool sticks = g_sticks_since && armTicksToNs(now_tick - g_sticks_since) >= kStickHoldNs;
+      const bool combo = start_back || sticks;
       if (combo && !g_combo_prev) {
         rex_nx_menu_open = !rex_nx_menu_open;
         rex_nx_menu_cursor = 0;
+        rex_nx_menu_page = 0;
         g_neutral = true;
-        std::printf("[nx] menu: %s (start+back)\n", rex_nx_menu_open ? "open" : "closed");
-        std::fflush(stdout);
+        g_menu_via_sticks = !start_back;
       }
       g_combo_prev = combo;
       if (rex_nx_menu_open) {
         const uint16_t pressed = all & ~g_prev_all;
-        if (pressed & X_INPUT_GAMEPAD_DPAD_UP) rex_nx_menu_cursor = (rex_nx_menu_cursor + kMenuItems - 1) % kMenuItems;
-        if (pressed & X_INPUT_GAMEPAD_DPAD_DOWN) rex_nx_menu_cursor = (rex_nx_menu_cursor + 1) % kMenuItems;
-        if (pressed & X_INPUT_GAMEPAD_B) {  // the Switch A button (right) confirms
-          if (rex_nx_menu_cursor == 0) rex_nx_menu_open = 0;
-          else if (rex_nx_menu_cursor == 1) rex_nx_show_fps = !rex_nx_show_fps;
-          else if (rex_nx_menu_cursor == 2) rex_nx_sound = !rex_nx_sound;
-          else rex_nx_overlay = !rex_nx_overlay;
-          if (rex_nx_menu_cursor) rex_nx_save_settings();
-          std::printf("[nx] menu: item %d confirmed: fps %d, sound %d, overlay %d\n", rex_nx_menu_cursor, rex_nx_show_fps,
-                      rex_nx_sound, rex_nx_overlay);
+        const int max_cursor = (rex_nx_menu_page ? kCheatItems : kMainItems) - 1;
+        if (pressed & X_INPUT_GAMEPAD_DPAD_UP) rex_nx_menu_cursor = (rex_nx_menu_cursor + max_cursor) % (max_cursor + 1);
+        if (pressed & X_INPUT_GAMEPAD_DPAD_DOWN) rex_nx_menu_cursor = (rex_nx_menu_cursor + 1) % (max_cursor + 1);
+        // D-pad left / right change the value (left = previous, right = next, wrap around); held, they repeat.
+        const int dir = ((all & X_INPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0) - ((all & X_INPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0);
+        bool changed = false;
+        if (dir != g_rep_dir) {
+          g_rep_dir = dir;
+          g_rep_next = now_tick + armNsToTicks(kRepeatDelayNs);
+          if (dir) changed = MenuChange(dir, false);
+        } else if (dir && now_tick >= g_rep_next) {
+          g_rep_next = now_tick + armNsToTicks(kRepeatNs);
+          changed = MenuChange(dir, false);
+        }
+        if (pressed & X_INPUT_GAMEPAD_A) changed |= MenuChange(1, true);  // the Switch A button confirms
+        if (changed) {
+          g_menu_dirty = true;
+          std::printf("[nx] menu: page %d item %d: fps %d, sound %d, overlay %d, cheats %d%d%d%d, start level %s\n",
+                      rex_nx_menu_page, rex_nx_menu_cursor, rex_nx_show_fps, rex_nx_sound, rex_nx_overlay,
+                      rex_nx_cheat_invincible, rex_nx_cheat_mp, rex_nx_cheat_continues, rex_nx_cheat_attributes,
+                      rex_nx_level_name(rex_nx_start_level));
           std::fflush(stdout);
         }
-        if (pressed & X_INPUT_GAMEPAD_A) rex_nx_menu_open = 0;  // the Switch B button (bottom) goes back
+        if (pressed & X_INPUT_GAMEPAD_B) {  // the Switch B button goes back
+          if (rex_nx_menu_page) {
+            rex_nx_menu_page = 0;
+            rex_nx_menu_cursor = 6;
+          } else {
+            rex_nx_menu_open = 0;
+          }
+        }
         g_neutral = true;
+      }
+      if (!rex_nx_menu_open) g_rep_dir = 0;
+      // Write settings.txt once the D-pad is released (not on every repeat step) or when the menu closes.
+      if (g_menu_dirty && (!rex_nx_menu_open || g_rep_dir == 0)) {
+        g_menu_dirty = false;
+        rex_nx_save_settings();
+      }
+      if (rex_nx_menu_open != g_menu_open_logged) {
+        g_menu_open_logged = rex_nx_menu_open;
+        std::printf("[nx] menu: %s (%s)\n", rex_nx_menu_open ? "open" : "closed",
+                    rex_nx_menu_open ? (g_menu_via_sticks ? "l3+r3" : "start+back") : "combo or menu button");
+        std::fflush(stdout);
       }
       g_prev_all = all;
       if (g_neutral && !all && !rex_nx_menu_open) g_neutral = false;

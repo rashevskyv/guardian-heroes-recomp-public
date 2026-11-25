@@ -8,6 +8,8 @@ Workflow (run from the repo root; the game files are game/pkg/media/chara_ss.mrg
     python3 -I tools/spritemod.py apply  chara_ss 0         # builds the new .mrg, keeps chara_ss.mrg.orig
     python3 -I tools/spritemod.py restore chara_ss          # puts the original back
     python3 -I tools/spritemod.py export-all mods           # every Remix sprite for the runtime hook (section 8)
+    python3 -I tools/spritemod.py export-textures game/pkg/media/chara_select.mrg mods/textures
+                                                            # true-colour textures (portraits) for mods/textures/
 
 The game then loads the patched file; nothing in the program changes. Copy the .mrg to the console the same way as
 the original. Game data and exported images never go into git (mods/ is ignored).
@@ -297,6 +299,39 @@ def cmd_export_all(out):
     print('wrote %d HD frames, %d Saturn-size frames, %d shared (skipped)' % (n_hd, n_ss, len(shared)))
 
 
+def cmd_export_textures(path, out):
+    """Every texture entry (portraits etc.) of an .mrg / .mrgc as RGBA PNG for the true-colour hook (mods/textures/):
+    out/<base>_t<NN>__<id>.png. The id hashes the bytes the Switch renderer stages: the untiled texels with the
+    fetch endian swap applied (RGBA8: 8in32, each texel reversed; DXT: 8in16, each 16-bit word swapped)."""
+    import struct
+    import gh_tex
+    m = gh_tex.mrg_of(path)
+    base = os.path.splitext(os.path.basename(path))[0]
+    os.makedirs(out, exist_ok=True)
+    n = 0
+    for i in range(m.n):
+        x = m.get(i)
+        img = gh_tex.decode_entry(x)
+        if img is None:
+            continue
+        fmt, w, h, ds = struct.unpack('>4I', x[:16])
+        raw = x[0x1000:0x1000 + ds]
+        if fmt == 2:
+            wt, ht, lb = w, h, 2
+        else:
+            wt, ht, lb = (w + 3) // 4, (h + 3) // 4, 3 if fmt == 4 else 4
+        staged = gh_tex.untile(raw, wt, ht, lb)
+        staged = staged[..., ::-1] if fmt == 2 else staged.reshape(ht, wt, -1, 2)[..., ::-1]
+        if int(gh_tex.tiled_offsets((wt + 31) & ~31, (ht + 31) & ~31, lb)[:ht, :wt].max()) + (1 << lb) > len(raw):
+            print('warning: entry %d is shorter than its tiled size, its id may not match the game' % i)
+        tid = sprite_id(w, h, staged.tobytes())
+        name = '%s_t%02d__%s.png' % (base, i, tid)
+        Image.fromarray(img, 'RGBA').save(os.path.join(out, name))
+        print(i, name)
+        n += 1
+    print('exported %d textures to %s' % (n, out))
+
+
 def cmd_restore(name):
     src, _ = paths(name)
     if os.path.exists(src + '.orig'):
@@ -312,6 +347,8 @@ if __name__ == '__main__':
         cmd_apply_adaptive(a[1], int(a[2]), '--soft-alpha' in a, '--costumes=derive' in a)
     elif len(a) == 2 and a[0] == 'export-all':
         cmd_export_all(a[1])
+    elif len(a) == 3 and a[0] == 'export-textures':
+        cmd_export_textures(a[1], a[2])
     elif len(a) >= 3 and a[0] in ('export', 'apply'):
         {'export': cmd_export, 'apply': cmd_apply}[a[0]](a[1], int(a[2]))
     elif len(a) == 2 and a[0] == 'restore':

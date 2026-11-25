@@ -242,6 +242,17 @@ void GhSettings::DrawControls() {
   }
 }
 
+void GhSettings::DrawCheats() {
+  ImGui::TextDisabled("Take effect at once. Save to gh.toml to keep them.");
+  const struct { const char* cvar; const char* label; } cheats[] = {
+      {"cheat_invincible", "Health always full"}, {"cheat_mp", "Magic always full"},
+      {"cheat_continues", "99 continues"}, {"cheat_attributes", "All attributes at maximum"}};
+  for (const auto& c : cheats) {
+    bool on = CvarBool(c.cvar);
+    if (ImGui::Checkbox(c.label, &on)) SetBool(c.cvar, on);
+  }
+}
+
 void GhSettings::OnDraw(ImGuiIO& io) {
   PollPad(io);
   if (!open_) return;
@@ -255,6 +266,7 @@ void GhSettings::OnDraw(ImGuiIO& io) {
       if (ImGui::BeginTabItem("Display")) { DrawDisplay(); ImGui::EndTabItem(); }
       if (ImGui::BeginTabItem("Audio")) { DrawAudio(); ImGui::EndTabItem(); }
       if (ImGui::BeginTabItem("Controls")) { DrawControls(); ImGui::EndTabItem(); }
+      if (ImGui::BeginTabItem("Cheats")) { DrawCheats(); ImGui::EndTabItem(); }
       ImGui::EndTabBar();
     }
     ImGui::Separator();

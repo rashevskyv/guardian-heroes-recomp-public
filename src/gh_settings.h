@@ -31,6 +31,7 @@ class GhSettings : public rex::ui::ImGuiDialog {
   void DrawDisplay();
   void DrawAudio();
   void DrawControls();
+  void DrawCheats();
 
   std::function<rex::Runtime*()> runtime_;
   std::function<rex::ui::Window*()> window_;

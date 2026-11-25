@@ -11,6 +11,7 @@
 
 #include <switch.h>
 
+#include "../clock_governor.h"
 #include "gh_version.h"  // written by switch/build.sh: GH_VERSION, GH_BUILD_UTC
 
 // The version the deko3d backend prints on screen (src/gpu/deko3d_backend.cpp, overlay strip).
@@ -51,8 +52,19 @@ const char* const kDataDir = "sdmc:/switch/gh";
 Thread log_flush_thread;
 volatile bool log_flush_running = false;
 
-// CPU 1785 MHz (the highest), GPU 768 MHz (docked's rate), memory 1600 MHz, as the Xbox ports do.
-// The old rates come back on exit.
+// Automatic clocks (switch/clock_governor.h, adapted from the HCU port's governor). settings.txt:
+//   auto_clock=1 (default; 0 = fixed at the maximum, the old behaviour), clock_max_cpu=1785, clock_max_gpu=768,
+//   clock_max_mem=1600 (MHz; 0 or unset = these defaults; a larger value is cut to them, a smaller one snaps down to a
+//   pcv table rate). With auto_clock the CPU and GPU start on the first rung of a handheld or docked ladder and go up
+//   when the game loses frames (swaps counted in the SDK's command processor, sdk-edits.py) and down after calm; the
+//   memory is set once to its maximum. Every rate is capped by the limits before it is set. The old rates come back on
+//   exit and in the crash handler.
+extern "C" {
+volatile uint64_t rex_nx_swaps = 0;  // guest swaps (frames), counted by the SDK's command processor
+volatile int rex_nx_auto_clock = 1;  // read here, kept by the pad menu's save (nx_input_driver.cpp)
+volatile int rex_nx_clock_max_cpu = 1785, rex_nx_clock_max_gpu = 768, rex_nx_clock_max_mem = 1600;
+}
+
 struct Clock {
     const char* name;
     PcvModuleId module;
@@ -63,11 +75,22 @@ struct Clock {
     volatile u32 set;
 };
 Clock clocks[] = {
-    {"CPU", PcvModuleId_CpuBus, 1785000000},
-    {"GPU", PcvModuleId_GPU, 768000000},
-    {"memory", PcvModuleId_EMC, 1600000000},
+    {"CPU", PcvModuleId_CpuBus, gh_clock::kMaxCpu * 1000u},
+    {"GPU", PcvModuleId_GPU, gh_clock::kMaxGpu * 1000u},
+    {"memory", PcvModuleId_EMC, gh_clock::kMaxMem * 1000u},
 };
-bool clkrst_up = false;
+std::atomic<bool> clkrst_up{false};
+std::atomic<bool> gov_on{false};
+gh_clock::Limits limits = gh_clock::kDefaultLimits;  // kHz
+gh_clock::Governor gov;
+gh_clock::Ladder gov_ladder = gh_clock::ladder_for(false);
+bool gov_docked = false;
+struct GovSnap { u64 swaps, tick; };
+GovSnap gov_ring[10];  // the swap count and the time at the last 10 passes (0.1 s each): the window is one second
+int gov_n = 0;         // passes since the last rung or ladder change
+unsigned gov_pass = 0;
+bool manager = false;  // sys-clk or Horizon OC is loaded
+gh_clock::Contest contest[3];
 
 // Is another process serving this name? (sys-clk's own check.)
 bool service_running(const char* name) {
@@ -81,16 +104,65 @@ bool service_running(const char* name) {
     return rc == MAKERESULT(21, 4);
 }
 
-void raise_clocks() {
-    // sys-clk and Horizon OC set the clocks themselves; fighting them froze consoles (NFSU2's port).
-    if (service_running("sys:clk") || service_running("hoc:clk")) {
-        std::printf("[clock] sys-clk or Horizon OC is running: the clocks are left to it\n");
-        return;
+void read_clock_settings() {
+    if (FILE* fp = std::fopen("sdmc:/switch/gh/settings.txt", "r")) {
+        char line[64];
+        while (std::fgets(line, sizeof(line), fp)) {
+            int v = 0;
+            if (std::sscanf(line, "auto_clock=%d", &v) == 1) rex_nx_auto_clock = v != 0;
+            else if (std::sscanf(line, "clock_max_cpu=%d", &v) == 1) rex_nx_clock_max_cpu = v;
+            else if (std::sscanf(line, "clock_max_gpu=%d", &v) == 1) rex_nx_clock_max_gpu = v;
+            else if (std::sscanf(line, "clock_max_mem=%d", &v) == 1) rex_nx_clock_max_mem = v;
+        }
+        std::fclose(fp);
     }
+    using namespace gh_clock;
+    limits.cpu = limit_from_mhz(kCpuTable, rex_nx_clock_max_cpu > 0 ? rex_nx_clock_max_cpu : 0, kMaxCpu);
+    limits.gpu = limit_from_mhz(kGpuTable, rex_nx_clock_max_gpu > 0 ? rex_nx_clock_max_gpu : 0, kMaxGpu);
+    limits.mem = limit_from_mhz(kMemTable, rex_nx_clock_max_mem > 0 ? rex_nx_clock_max_mem : 0, kMaxMem);
+    rex_nx_clock_max_cpu = limits.cpu / 1000;  // what the menu's save writes back: the values in force
+    rex_nx_clock_max_gpu = limits.gpu / 1000;
+    rex_nx_clock_max_mem = limits.mem / 1000;
+}
+
+// Sets CPU and GPU to a rung (already capped by the limits) and reads the rates back.
+void set_pair(gh_clock::Rung rung) {
+    if (!clkrst_up.load()) return;
+    const u32 want[2] = {rung.cpu * 1000u, rung.gpu * 1000u};
+    for (int i = 0; i < 2; i++) {
+        Clock& clock = clocks[i];
+        clock.wanted = want[i];
+        if (!clock.open) continue;
+        clock.set = want[i];  // before the set: keep_clocks must not put the old rate back
+        const Result rc = clkrstSetClockRate(&clock.session, want[i]);
+        u32 got = 0;
+        if (R_SUCCEEDED(clkrstGetClockRate(&clock.session, &got)) && got) clock.set = got;
+        if (R_FAILED(rc)) std::printf("[clock] %s: set to %u MHz refused (rc 0x%X)\n", clock.name, want[i] / 1000000, rc);
+    }
+}
+
+void raise_clocks() {
+    read_clock_settings();  // first: the menu's save writes these values back, also when the clocks are left alone
+    // sys-clk and Horizon OC set the clocks themselves; fighting them froze consoles (NFSU2's port). A loaded manager
+    // that is switched off or has no profile for this title sets nothing, so the governor runs; keep_clocks stops it
+    // as soon as the manager puts a rate back twice.
+    manager = service_running("sys:clk") || service_running("hoc:clk");
+    if (manager) std::printf("[clock] sys-clk or Horizon OC is loaded: the governor runs until it sets a clock itself\n");
     if (!hosversionAtLeast(8, 0, 0) || R_FAILED(clkrstInitialize())) {
         std::printf("[clock] no clkrst: the clocks are unchanged\n");
         return;
     }
+    const bool automatic = rex_nx_auto_clock != 0;
+    gov_docked = appletGetOperationMode() == AppletOperationMode_Console;
+    gov_ladder = gh_clock::ladder_for(gov_docked);
+    gov.reset(gov_ladder.count);
+    const gh_clock::Rung first = gh_clock::apply_limits(gov_ladder.rungs[0], limits);
+    clocks[0].wanted = automatic ? first.cpu * 1000u : limits.cpu * 1000u;
+    clocks[1].wanted = automatic ? first.gpu * 1000u : limits.gpu * 1000u;
+    clocks[2].wanted = limits.mem * 1000u;
+    std::printf("[clock] auto_clock=%d, limits CPU %u, GPU %u, memory %u MHz (%s, ladder %s, %d rungs)\n", automatic ? 1 : 0,
+                limits.cpu / 1000, limits.gpu / 1000, limits.mem / 1000, gov_docked ? "docked" : "handheld", gov_ladder.name,
+                gov_ladder.count);
     clkrst_up = true;
     for (Clock& clock : clocks) {
         if (R_FAILED(clkrstOpenSession(&clock.session, clock.module, 3))) {
@@ -99,7 +171,7 @@ void raise_clocks() {
         }
         clock.open = true;
         clkrstGetClockRate(&clock.session, &clock.old);
-        // Never lower a rate (docked memory, or someone else's overclock).
+        // Never lower a rate here (docked memory, or someone else's overclock). The ladders start above stock.
         const Result rc = clock.old < clock.wanted ? clkrstSetClockRate(&clock.session, clock.wanted) : 0;
         u32 now = 0;
         clkrstGetClockRate(&clock.session, &now);
@@ -107,23 +179,73 @@ void raise_clocks() {
         std::printf("[clock] %s %u -> %u MHz%s\n", clock.name, clock.old / 1000000, now / 1000000,
                     R_FAILED(rc) ? " (refused)" : "");
     }
+    gov_on = automatic;
+}
+
+// 0.1 s passes (log_flush_loop). The window is the last second of swaps. Only a full second with 30 or more swaps counts
+// (a load or a menu with few frames keeps the rung). The console mode is read every 2 s: a dock change starts the other
+// ladder on its first rung.
+void govern() {
+    if (!gov_on.load()) return;
+    const GovSnap cur = {rex_nx_swaps, armGetSystemTick()};
+    const bool full = gov_n >= 10;
+    const GovSnap base = gov_ring[gov_n % 10];
+    gov_ring[gov_n % 10] = cur;
+    gov_n++;
+    const bool slow = ++gov_pass % 20 == 0;
+    if (slow) {
+        const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+        if (docked != gov_docked) {
+            gov_docked = docked;
+            gov_ladder = gh_clock::ladder_for(docked);
+            gov.reset(gov_ladder.count);
+            gov_n = 0;
+            set_pair(gh_clock::apply_limits(gov_ladder.rungs[0], limits));
+            std::printf("[clock] auto: %s, ladder %s, rung 0 (CPU %u, GPU %u MHz)\n", docked ? "docked" : "handheld",
+                        gov_ladder.name, unsigned(clocks[0].set / 1000000), unsigned(clocks[1].set / 1000000));
+            return;
+        }
+    }
+    const u64 dticks = cur.tick - base.tick;
+    const u32 dsw = u32(cur.swaps - base.swaps);
+    if (!full || dsw < 30 || dticks == 0) return;
+    const double secs = double(dticks) / double(armGetSystemTickFreq());
+    const double lost = gh_clock::lost_frames(dsw, secs);
+    const int was = gov.rung;
+    const int to = gov.judge(slow, lost);
+    if (to == was) return;
+    set_pair(gh_clock::apply_limits(gov_ladder.rungs[to], limits));
+    gov_n = 0;  // the next judgement needs a second of the new rate
+    std::printf("[clock] auto: %.1f frames lost in %.2f s (%u swaps), ladder %s, rung %d -> %d: CPU %u, GPU %u MHz "
+                "(wait %u samples)\n", lost, secs, dsw, gov_ladder.name, was, to, unsigned(clocks[0].set / 1000000),
+                unsigned(clocks[1].set / 1000000), gov.wait);
 }
 
 // HOME, docking and sleep put the system's clocks back: set ours again.
 void keep_clocks() {
-    for (Clock& clock : clocks) {
+    for (int i = 0; i < 3; i++) {
+        Clock& clock = clocks[i];
         u32 now = 0;
-        if (clock.set == 0 || R_FAILED(clkrstGetClockRate(&clock.session, &now)) || now >= clock.set) {
-            continue;
+        if (clock.set == 0 || R_FAILED(clkrstGetClockRate(&clock.session, &now))) continue;
+        // ponytail: a manager that holds a rate ABOVE ours is not seen here; it only undoes the governor's steps down.
+        if (manager && contest[i].lost(now < clock.set)) {
+            std::printf("[clock] sys-clk or Horizon OC holds the %s at %u MHz (ours was %u): the clocks are left to it\n",
+                        clock.name, now / 1000000, clock.set / 1000000);
+            gov_on = false;
+            for (Clock& c : clocks) c.set = 0;  // no more sets; restore_clocks still puts the old rates back once
+            return;
         }
+        if (now >= clock.set) continue;
         clkrstSetClockRate(&clock.session, clock.set);
         std::printf("[clock] %s was put back to %u MHz: set to %u MHz again\n", clock.name, now / 1000000,
                     clock.set / 1000000);
     }
 }
 
+// Exit and crash: the governor stops first, then the old rates come back. Safe to call twice and from the crash handler.
 void restore_clocks() {
-    if (!clkrst_up) {
+    gov_on = false;
+    if (!clkrst_up.exchange(false)) {
         return;
     }
     for (Clock& clock : clocks) {
@@ -135,7 +257,7 @@ void restore_clocks() {
         }
     }
     clkrstExit();
-    clkrst_up = false;
+    std::printf("[clock] the old clocks are back\n");
 }
 
 // libnx's exit ends here instead of returning to hbl, with the services closed. Returning to hbl
@@ -331,8 +453,10 @@ void log_flush_loop(void*) {
     const u64 start = armGetSystemTick();
     u64 last_profile = start;
     for (unsigned tick = 1; log_flush_running; tick++) {
-        svcSleepThread(500'000'000LL);
-        if (tick % 4 == 0) {
+        svcSleepThread(100'000'000LL);  // 0.1 s: the clock governor every pass, the log every 5th, the 2-s line every 20th
+        govern();
+        if (tick % 5 != 0) continue;
+        if (tick % 20 == 0) {
             u64 used = 0;
             svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
             const u64 now = armGetSystemTick();
@@ -594,6 +718,9 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
                      (i % 4 == 3) ? "\n" : "");
     }
     std::fprintf(stdout, "\n  fp 0x%016llX\n", (unsigned long long)ctx->fp.x);
+    std::fflush(stdout);
+    fsync(fileno(stdout));
+    restore_clocks();  // a crash does not run userAppExit: put the old clocks back here
     std::fflush(stdout);
     fsync(fileno(stdout));
 }

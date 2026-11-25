@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gh {
@@ -25,7 +26,10 @@ struct ModSprite {
   uint32_t w = 0, h = 0;
   std::vector<uint8_t> index;
   uint8_t palette[256 * 4] = {};  // R, G, B, A
-  // Renderer-owned handles (created on first use).
+  // True-colour store (textures, SpriteMod::Init(dir, true)): the PNG as RGBA in `rgba`, no index or palette.
+  bool true_colour = false;
+  std::vector<uint8_t> rgba;
+  // Renderer-owned handles (created on first use). A true-colour replacement uses index_image for its RGBA image.
   void* index_image = nullptr;
   void* clut_image = nullptr;
   bool game_palette = false;  // an indexed PNG: its indices are the game's own palette indices, the game's palette stays
@@ -35,14 +39,20 @@ struct ModSprite {
 class SpriteMod {
  public:
   // Lists `dir` once (no per-upload file system calls). Returns the number of mod files found.
-  size_t Init(const std::string& dir);
-  // The replacement for a texture, loading it on first use; nullptr when there is none or it does not load.
+  // true_colour: keep the PNG as RGBA (the true-colour textures), no quantising.
+  size_t Init(const std::string& dir, bool true_colour = false);
+  // The replacement for a texture, loading it on first use; nullptr when there is none or it does not load
+  // (then last_error() is set; it is cleared at every call).
   ModSprite* Find(uint32_t w, uint32_t h, uint64_t hash);
+  // Some file has the id prefix "<w>x<h>_": a cheap check before hashing a texture.
+  bool HasSize(uint32_t w, uint32_t h) const { return sizes_.count((uint64_t(w) << 32) | h) != 0; }
   size_t file_count() const { return files_.size(); }
   const std::string& last_error() const { return error_; }
 
  private:
   std::string dir_;
+  bool true_colour_ = false;
+  std::unordered_set<uint64_t> sizes_;  // w << 32 | h of every file's id
   std::unordered_map<std::string, std::string> files_;  // id -> path
   std::unordered_map<std::string, ModSprite*> loaded_;  // id -> sprite (nullptr: failed)
   std::string error_;

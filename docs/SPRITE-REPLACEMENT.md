@@ -9,7 +9,8 @@ Background: `docs/SPRITES-RESEARCH.md`. Nothing here needs a change to the game 
 - Every character sprite frame of the Remix mode. One frame is one PNG.
 - Any size. A 2x or 4x picture of the same frame works. The game scales it to the frame's place.
 - Many colours. A true-colour PNG is drawn with its own 255-colour palette.
-- Not covered: backgrounds, portraits, UI textures, and the Original mode.
+- Portraits, backgrounds and UI textures (true-colour RGBA8 and DXT textures): see "Portraits and other true-colour textures" below.
+- Not covered: the Original mode sprites, 4 bit (k_4_4_4_4) textures such as the UI font atlas, and the PC builds.
 
 ## What you need
 
@@ -100,6 +101,28 @@ A worked check with pictures: `docs/SPRITES-RESEARCH.md`, section 8, and `docs/s
 - **Only 255 colours.** A true-colour PNG with more colours is reduced (median cut). Alpha is on or off; soft edges become hard.
 - **A short pause at first use.** A big PNG is decoded and quantised when the sprite is first drawn. Not measured yet.
 - **PC.** The Linux and Windows builds have no sprite hook yet. The guide is Switch only.
+
+## Portraits and other true-colour textures
+
+Build 0.80 or later. The character select portraits and other RGBA8 or DXT textures can be replaced by PNG files too.
+
+1. Export the textures of one game file:
+   ```bash
+   python3 -I tools/spritemod.py export-textures game/pkg/media/chara_select.mrg mods/textures
+   ```
+   It writes `mods/textures/<file>_t<entry>__<id>.png` for every texture entry. `.mrgc` files also work.
+2. Repaint or upscale. Any size works. Keep the part after `__`.
+3. Copy the PNGs to `sdmc:/switch/gh/mods/textures/` (flat folder, listed once at start).
+
+- The id is `<width>x<height>_<hash>`, like the sprite id. Width and height are the game texture size. The hash covers the texture bytes as the renderer stages them.
+- The PNG pixels go to the GPU unchanged: no palette, no colour reduction. The exported PNG has the alpha convention of the game file. If the original edges look dark in the export, the game data is premultiplied: keep your picture premultiplied too.
+- The largest replacement is 24 MB of RGBA (about 2500x2500). A larger one is not used.
+- Log lines in `gh_log.txt`:
+  - `texture mod: N replacement file(s) in .../mods/textures/`: the folder was found.
+  - `texture mod: <id> replaced (WxH -> WxH)`: the texture was drawn with your file.
+  - `texture mod: no file for <id> (<format> at <address>)`: a file has this size, but no file has this id. If the game uses another id than the export, rename your file to this id.
+  - `texture mod: <error>`: a file did not load.
+  - With the `dk_dump_tex` marker: `texture id <id> (<format>)` for every RGBA8 and DXT texture.
 
 ## Another way: patch the game file
 
