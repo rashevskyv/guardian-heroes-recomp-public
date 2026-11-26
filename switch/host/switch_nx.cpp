@@ -61,6 +61,9 @@ volatile bool log_flush_running = false;
 //   exit and in the crash handler.
 extern "C" {
 volatile uint64_t rex_nx_swaps = 0;  // guest swaps (frames), counted by the SDK's command processor
+// The [dk] perf line (deko3d_backend.cpp): WAIT_REG_MEM time by kind (sdk-edits.py: 0 registers, 1 memory ..1002,
+// 2 memory ..1006, 3 other memory), the game's GPU poll (cheats.cpp) and the calls of the 4P hooks (story4p.cpp).
+volatile uint64_t rex_nx_wait_kind_ns[4] = {}, rex_nx_guest_poll_ticks = 0, rex_nx_hook_calls = 0;
 volatile int rex_nx_auto_clock = 1;  // read here, kept by the pad menu's save (nx_input_driver.cpp)
 volatile int rex_nx_clock_max_cpu = 1785, rex_nx_clock_max_gpu = 768, rex_nx_clock_max_mem = 1600;
 }

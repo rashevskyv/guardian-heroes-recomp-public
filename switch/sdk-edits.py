@@ -1007,6 +1007,31 @@ edit('src/filesystem/devices/host_path_file.cpp', [
 ])
 print('changed (20):', *changed, sep=NL + '  ')
 
+# gh 0.112: the poll sleep is a setting (gpu_wait_us, nx_input_driver.cpp) instead of a fixed millisecond. The first
+# edit below migrates a tree that already has the old insert, so the insert itself keeps one text (see edit()).
+NX_POLL_SLEEP_OLD = '          rex::thread::Sleep(std::chrono::milliseconds(1));' + NL
+NX_POLL_SLEEP = ('          {' + NL +
+                 '            extern volatile int rex_nx_gpu_wait_us __asm__("rex_nx_gpu_wait_us");  // nx_input_driver.cpp' + NL +
+                 '            const int nx_us = rex_nx_gpu_wait_us;' + NL +
+                 '            rex::thread::Sleep(std::chrono::microseconds(nx_us > 0 ? nx_us : 1000));' + NL +
+                 '          }' + NL)
+NX_SLEPT = '          rex_nx_wait_slept_ticks += rex::chrono::Clock::QueryHostTickCount() - nx_t0;' + NL
+edit('src/graphics/command_processor.cpp', [(NX_POLL_SLEEP_OLD + NX_SLEPT, NX_POLL_SLEEP + NX_SLEPT)], must=False)
+# The same for the wait time by kind (the [dk] perf line of the deko3d backend).
+NX_WAIT_NS = '    if (freq) cp_stats.wait_poll_ns += (rex::chrono::Clock::QueryHostTickCount() - nx_wait_start) * 1000000000ull / freq;' + NL
+NX_WAIT_LOG = '    if (nx_log_this && freq) {' + NL
+NX_WAIT_KIND_OLD = ('    if (freq) {' + NL +
+                '      extern volatile uint64_t rex_nx_wait_kind_ns[4] __asm__("rex_nx_wait_kind_ns");  // switch_nx.cpp' + NL +
+                '      const uint32_t nx_low = poll_reg_addr & 0xFF;' + NL +
+                '      const int nx_kind = !is_memory ? 0 : nx_low == 0x02 ? 1 : nx_low == 0x06 ? 2 : 3;' + NL +
+                '      rex_nx_wait_kind_ns[nx_kind] = rex_nx_wait_kind_ns[nx_kind] +' + NL +
+                '          (rex::chrono::Clock::QueryHostTickCount() - nx_wait_start) * 1000000000ull / freq;' + NL +
+                '    }' + NL)
+# gh 0.118: Switch only (0.112-0.117 had it unguarded: the Linux and Windows libraries did not link or load).
+NX_WAIT_KIND = '#if REX_PLATFORM_SWITCH' + NL + NX_WAIT_KIND_OLD + '#endif' + NL
+edit('src/graphics/command_processor.cpp', [(NX_WAIT_NS + NX_WAIT_KIND_OLD + NX_WAIT_LOG, NX_WAIT_NS + NX_WAIT_KIND + NX_WAIT_LOG)], must=False)
+edit('src/graphics/command_processor.cpp', [(NX_WAIT_NS + NX_WAIT_LOG, NX_WAIT_NS + NX_WAIT_KIND + NX_WAIT_LOG)], must=False)
+
 # --- WAIT_REG_MEM statistics (Switch): how often the command processor polls a guest value and how
 # long it sleeps for it (the game's vblank/fence waits go through here). switch_nx.cpp prints them.
 edit('src/graphics/command_processor.cpp', [
@@ -1021,7 +1046,7 @@ edit('src/graphics/command_processor.cpp', [
      '          // The blind sleep per poll capped at 1 ms (the asked value is counted above): the' + NL +
      '          // vblank worker and the guest callback pace the frame, not this sleep.' + NL +
      '          const uint64_t nx_t0 = rex::chrono::Clock::QueryHostTickCount();' + NL +
-     '          rex::thread::Sleep(std::chrono::milliseconds(1));' + NL +
+     NX_POLL_SLEEP +
      '          rex_nx_wait_slept_ticks += rex::chrono::Clock::QueryHostTickCount() - nx_t0;' + NL +
      '#else' + NL +
      '          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));' + NL +
@@ -1173,6 +1198,7 @@ edit('src/graphics/command_processor.cpp', [
      '  {' + NL +
      '    const uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();' + NL +
      '    if (freq) cp_stats.wait_poll_ns += (rex::chrono::Clock::QueryHostTickCount() - nx_wait_start) * 1000000000ull / freq;' + NL +
+     NX_WAIT_KIND +
      '    if (nx_log_this && freq) {' + NL +
      '      REXGPU_INFO("  ... satisfied after {} ms", (rex::chrono::Clock::QueryHostTickCount() - nx_wait_start) * 1000 / freq);' + NL +
      '    }' + NL +

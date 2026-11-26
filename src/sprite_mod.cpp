@@ -376,39 +376,62 @@ bool QuantiseRgba(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, ModS
 }
 
 // ----- the store ---------------------------------------------------------------------------------------------
-size_t SpriteMod::Init(const std::string& dir, bool true_colour) {
-  dir_ = dir;
-  if (!dir_.empty() && dir_.back() != '/') dir_ += '/';
+void SpriteMod::Reset(bool true_colour) {
   true_colour_ = true_colour;
   files_.clear();
   sizes_.clear();
-  DIR* d = opendir(dir_.c_str());
+  conflicts_.clear();
+  file_count_ = 0;
+}
+
+size_t SpriteMod::Init(const std::string& dir, bool true_colour) {
+  Reset(true_colour);
+  return AddDir(dir, 0);
+}
+
+size_t SpriteMod::AddDir(const std::string& dir_in, int mod) {
+  std::string dir = dir_in;
+  if (!dir.empty() && dir.back() != '/') dir += '/';
+  DIR* d = opendir(dir.c_str());
   if (!d) return 0;
+  size_t found = 0;
   while (dirent* e = readdir(d)) {
     std::string n = e->d_name;
     if (n.size() < 5 || n.compare(n.size() - 4, 4, ".png") != 0) continue;
     std::string stem = n.substr(0, n.size() - 4);
     size_t p = stem.rfind("__");
     std::string id = p == std::string::npos ? stem : stem.substr(p + 2);
-    files_[id] = dir_ + n;
+    std::vector<File>& files = files_[id];
+    if (!files.empty() && files.back().mod == mod) { files.back().path = dir + n; continue; }  // two names, one id
+    if (!files.empty()) conflicts_.push_back({id, files.front().mod, mod});
+    files.push_back({mod, dir + n});
+    found++;
     unsigned w = 0, h = 0;
     if (std::sscanf(id.c_str(), "%ux%u_", &w, &h) == 2) sizes_.insert((uint64_t(w) << 32) | h);
   }
   closedir(d);
-  return files_.size();
+  file_count_ += found;
+  return found;
 }
 
 ModSprite* SpriteMod::Find(uint32_t w, uint32_t h, uint64_t hash) {
   error_.clear();
   if (files_.empty()) return nullptr;
-  const std::string id = SpriteId(w, h, hash);
-  auto lit = loaded_.find(id);
-  if (lit != loaded_.end()) return lit->second;
-  auto fit = files_.find(id);
+  auto fit = files_.find(SpriteId(w, h, hash));
   if (fit == files_.end()) return nullptr;
+  for (const File& f : fit->second) {
+    if (enabled_ && !enabled_(f.mod)) continue;
+    auto lit = loaded_.find(f.path);
+    ModSprite* s = lit != loaded_.end() ? lit->second : Load(f.path, f.mod);
+    if (s) { error_.clear(); return s; }
+  }
+  return nullptr;
+}
+
+ModSprite* SpriteMod::Load(const std::string& path, int mod) {
   ModSprite* result = nullptr;
   std::vector<uint8_t> file;
-  if (FILE* fp = std::fopen(fit->second.c_str(), "rb")) {
+  if (FILE* fp = std::fopen(path.c_str(), "rb")) {
     std::fseek(fp, 0, SEEK_END);
     long sz = std::ftell(fp);
     std::fseek(fp, 0, SEEK_SET);
@@ -420,7 +443,7 @@ ModSprite* SpriteMod::Find(uint32_t w, uint32_t h, uint64_t hash) {
   }
   uint32_t pw = 0, ph = 0;
   std::vector<uint8_t> rgba, indices;
-  if (file.empty()) error_ = "cannot read " + fit->second;
+  if (file.empty()) error_ = "cannot read " + path;
   else if (DecodePng(file, pw, ph, rgba, error_, true_colour_ ? nullptr : &indices)) {
     auto* s = new ModSprite();
     if (true_colour_) {
@@ -432,10 +455,142 @@ ModSprite* SpriteMod::Find(uint32_t w, uint32_t h, uint64_t hash) {
     } else if (QuantiseRgba(rgba, pw, ph, *s)) result = s;
     else delete s;
   } else {
-    error_ = fit->second + ": " + error_;
+    error_ = path + ": " + error_;
   }
-  loaded_[id] = result;
+  if (result) result->mod = mod;
+  loaded_[path] = result;
   return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mod folders
+// ---------------------------------------------------------------------------------------------
+
+bool ParseModToml(const std::string& text, ModInfo& out, std::string& err) {
+  size_t pos = 0;
+  int line_no = 0;
+  auto trim = [](std::string v) {
+    const char* ws = " \t\r";
+    size_t a = v.find_first_not_of(ws);
+    if (a == std::string::npos) return std::string();
+    return v.substr(a, v.find_last_not_of(ws) - a + 1);
+  };
+  while (pos < text.size()) {
+    size_t end = text.find('\n', pos);
+    if (end == std::string::npos) end = text.size();
+    std::string line = trim(text.substr(pos, end - pos));
+    pos = end + 1;
+    line_no++;
+    if (line.empty() || line[0] == '#' || line[0] == '[') continue;
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) { err = "line " + std::to_string(line_no) + ": no '='"; return false; }
+    const std::string key = trim(line.substr(0, eq));
+    std::string value = trim(line.substr(eq + 1));
+    if (!value.empty() && (value[0] == '"' || value[0] == '\'')) {
+      size_t close = value.find(value[0], 1);
+      if (close == std::string::npos) { err = "line " + std::to_string(line_no) + ": the text has no closing quote"; return false; }
+      value = value.substr(1, close - 1);
+    } else {
+      value = trim(value.substr(0, value.find('#')));
+    }
+    if (key == "id") out.id = value;
+    else if (key == "name") out.name = value;
+    else if (key == "version") out.version = value;
+    else if (key == "author") out.author = value;
+    else if (key == "description") out.description = value;
+    else if (key == "kind") out.kind = value;
+    else if (key == "license" || key == "licence") out.license = value;
+    else if (key == "order") out.order = std::atoi(value.c_str());
+  }
+  return true;
+}
+
+namespace {
+
+bool HasPng(const std::string& dir) {
+  DIR* d = opendir(dir.c_str());
+  if (!d) return false;
+  bool found = false;
+  while (dirent* e = readdir(d)) {
+    const size_t n = std::strlen(e->d_name);
+    if (n > 4 && !std::strcmp(e->d_name + n - 4, ".png")) { found = true; break; }
+  }
+  closedir(d);
+  return found;
+}
+
+bool IsDir(const std::string& dir) {
+  DIR* d = opendir(dir.c_str());
+  if (d) closedir(d);
+  return d != nullptr;
+}
+
+bool ValidId(const std::string& id) {
+  if (id.empty() || id.size() > 31) return false;
+  for (char c : id)
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  return true;
+}
+
+}  // namespace
+
+std::vector<ModInfo> ScanMods(const std::string& mods_dir_in, std::vector<std::string>* notes) {
+  std::string mods_dir = mods_dir_in;
+  if (!mods_dir.empty() && mods_dir.back() != '/') mods_dir += '/';
+  auto note = [&](const std::string& t) { if (notes) notes->push_back(t); };
+  std::vector<ModInfo> mods;
+  std::vector<std::string> names;
+  if (DIR* d = opendir(mods_dir.c_str())) {
+    while (dirent* e = readdir(d)) names.push_back(e->d_name);
+    closedir(d);
+  }
+  for (const std::string& n : names) {
+    if (n == "." || n == ".." || n == "sprites" || n == "textures") continue;
+    const std::string dir = mods_dir + n + "/";
+    if (!IsDir(dir)) continue;
+    std::string text;
+    if (FILE* fp = std::fopen((dir + "mod.toml").c_str(), "rb")) {
+      char buf[4096];
+      size_t got;
+      while ((got = std::fread(buf, 1, sizeof(buf), fp)) > 0 && text.size() < 65536) text.append(buf, got);
+      std::fclose(fp);
+    } else {
+      note(n + ": no mod.toml, skipped");
+      continue;
+    }
+    ModInfo m;
+    std::string err;
+    if (!ParseModToml(text, m, err)) { note(n + ": mod.toml " + err + ", skipped"); continue; }
+    if (m.id.empty()) m.id = n;
+    if (m.id != n) { note(n + ": the id \"" + m.id + "\" is not the folder name, skipped"); continue; }
+    if (!ValidId(m.id) || m.id.compare(0, 7, "legacy-") == 0) {
+      note(n + ": the id must be 1-31 characters of a-z, 0-9, _ and -, and not start with legacy-; skipped");
+      continue;
+    }
+    if (m.name.empty()) m.name = m.id;
+    if (IsDir(dir + "sprites/")) m.sprites_dir = dir + "sprites/";
+    if (IsDir(dir + "textures/")) m.textures_dir = dir + "textures/";
+    if (m.sprites_dir.empty() && m.textures_dir.empty()) { note(n + ": no sprites/ or textures/ folder, skipped"); continue; }
+    mods.push_back(m);
+  }
+  std::sort(mods.begin(), mods.end(), [](const ModInfo& a, const ModInfo& b) {
+    return a.order != b.order ? a.order < b.order : a.id < b.id;
+  });
+  if (HasPng(mods_dir + "sprites/")) {
+    ModInfo m;
+    m.id = "legacy-sprites"; m.name = "legacy sprites"; m.kind = "sprites"; m.legacy = true;
+    m.description = "PNG files placed directly in mods/sprites/ (the old layout)";
+    m.sprites_dir = mods_dir + "sprites/";
+    mods.push_back(m);
+  }
+  if (HasPng(mods_dir + "textures/")) {
+    ModInfo m;
+    m.id = "legacy-textures"; m.name = "legacy textures"; m.kind = "textures"; m.legacy = true;
+    m.description = "PNG files placed directly in mods/textures/ (the old layout)";
+    m.textures_dir = mods_dir + "textures/";
+    mods.push_back(m);
+  }
+  return mods;
 }
 
 }  // namespace gh

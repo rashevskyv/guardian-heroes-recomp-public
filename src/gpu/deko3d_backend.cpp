@@ -65,6 +65,9 @@ REXCVAR_DEFINE_BOOL(deko3d_fill_rectangle, false, "GPU",
 // (file reads). This backend is their only consumer (there is no SharedMemory here).
 extern "C" volatile uint8_t rex_nx_dirty[0x20000];
 extern "C" volatile uint8_t rex_nx_dirty_coarse[0x200];
+// gh: the [dk] perf line. Counted by the SDK's command processor (sdk-edits.py: WAIT_REG_MEM time by kind), by the
+// guest's GPU poll hook (cheats.cpp) and by the 4P hooks (story4p.cpp); defined in switch_nx.cpp.
+extern "C" volatile uint64_t rex_nx_wait_kind_ns[4], rex_nx_guest_poll_ticks, rex_nx_hook_calls;
 
 namespace rex::graphics::deko {
 
@@ -97,8 +100,16 @@ void Log(const char* fmt, ...) {
   std::vprintf(fmt, ap);
   std::printf("\n");
   va_end(ap);
-  std::fflush(stdout);
+  // gh: no flush here. Each flush is a write to the SD card on the command processor's thread; the fights of 0.111
+  // wrote 35-45 lines a second. switch_nx.cpp flushes the log twice a second and in the crash handler.
 }
+
+// gh: per-second profile ([dk] perf): adds the time of its scope to a counter.
+struct Tick {
+  uint64_t& sum;
+  uint64_t t0 = armGetSystemTick();
+  ~Tick() { sum += armGetSystemTick() - t0; }
+};
 
 void DebugCallback(void*, const char* context, DkResult result, const char* message) {
   Log("deko3d %s: result %d: %s", context ? context : "?", int(result), message ? message : "");
@@ -150,6 +161,10 @@ struct HostImage {
   uint32_t guest_base = 0;    // textures and resolve destinations
   uint32_t edram_base = 0, edram_pitch = 0;  // render targets
   ::gh::ModSprite* mod = nullptr;  // gh: the replacement for this texture's contents (8 bit sprite or true-colour), if a mod folder has one
+  // gh: what the upload looked up, so a mod switched in the menu takes effect on the next draw (no new upload needed).
+  uint8_t mod_kind = 0;    // 0 no lookup, 1 sprite store, 2 texture store
+  uint64_t mod_hash = 0;
+  int mod_epoch = 0;       // rex_nx_mod_epoch at the lookup
 };
 
 class DkShaderObj : public Shader {
@@ -500,14 +515,23 @@ extern "C" const char* rex_nx_version(void);
 
 constexpr uint32_t kOverlayW = 512, kOverlayH = 20, kOverlayScale = 2;
 // The settings menu (Start+Back, see switch/host/input/nx_input_driver.cpp): a 256x214 panel, 9 lines.
-constexpr uint32_t kMenuW = 256, kMenuH = 192;
+constexpr uint32_t kMenuW = 400, kMenuH = 296;  // 32 characters a line; 9 list lines (the main page: 11, no description), 3 description lines, the key line
+constexpr int kMenuCols = 32;
 extern "C" volatile int rex_nx_menu_open;
 extern "C" volatile int rex_nx_menu_cursor;
-extern "C" volatile int rex_nx_menu_page;  // 0 main, 1 cheats
+extern "C" volatile int rex_nx_menu_page;  // 0 main, 1 cheats, 2 mods
+extern "C" const char* rex_nx_mod_description(int i);
+extern "C" const char* rex_nx_mod_info(int i);
+extern "C" volatile int rex_nx_mod_epoch;
+extern "C" int rex_nx_mod_count(void);
+extern "C" const char* rex_nx_mod_name(int i);
+extern "C" int rex_nx_mod_on(int i);
+extern "C" int rex_nx_register_mod(const char* id, const char* name, const char* description, const char* info);
 extern "C" volatile int rex_nx_show_fps;
 extern "C" volatile int rex_nx_sound;
+extern "C" volatile int rex_nx_controls_alt;  // the menu: 1 = the alternative control scheme (controls=alt)
+extern "C" volatile int rex_nx_frame_skip;   // the menu: 1 = draw every second guest frame (fps_cap=30)
 extern "C" volatile int rex_nx_hatching;     // the menu: 0 = no pencil hatching (PS CE23671D gets an empty mask)
-extern "C" volatile int rex_nx_sprite_mods;  // the menu: 0 = replaced sprites are drawn as the game's own
 extern "C" volatile int rex_nx_overlay;
 extern "C" volatile int rex_nx_cheat_invincible, rex_nx_cheat_mp, rex_nx_cheat_continues, rex_nx_cheat_attributes;
 extern "C" void rex_nx_load_settings(void);
@@ -559,7 +583,58 @@ constexpr Glyph kGlyphs[] = {
     {'y', {0, 0, 17, 17, 15, 1, 14}},
     {'>', {8, 4, 2, 1, 2, 4, 8}},
     {':', {0, 12, 12, 0, 12, 12, 0}},
+    {'j', {2, 0, 6, 2, 2, 18, 12}},
+    {'q', {0, 0, 13, 19, 15, 1, 1}},
+    {'w', {0, 0, 17, 17, 21, 21, 10}},
+    {'z', {0, 0, 31, 2, 4, 8, 31}},
+    {'_', {0, 0, 0, 0, 0, 0, 31}},
+    {'?', {14, 17, 1, 2, 4, 0, 4}},
+    {'!', {4, 4, 4, 4, 4, 0, 4}},
+    {',', {0, 0, 0, 0, 12, 4, 8}},
+    {'\'', {4, 4, 0, 0, 0, 0, 0}},
+    {'(', {2, 4, 8, 8, 8, 4, 2}},
+    {')', {8, 4, 2, 2, 2, 4, 8}},
+    {'/', {1, 1, 2, 4, 8, 16, 16}},
+    {'&', {12, 18, 20, 8, 21, 18, 13}},
 };
+
+// Menu text of a mod: what the font can draw. One '?' for every other character (a UTF-8 letter counts once).
+static std::string MenuPlain(const char* text) {
+  std::string out;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; p++) {
+    if ((*p & 0xC0) == 0x80) continue;  // the tail of a UTF-8 character
+    char ch = char(*p);
+    if (ch >= 'A' && ch <= 'Z' && ch != 'G' && ch != 'H') ch = char(ch - 'A' + 'a');
+    bool known = ch == ' ';
+    for (const Glyph& g : kGlyphs) known |= g.ch == ch;
+    out += known ? ch : '?';
+  }
+  return out;
+}
+
+// Splits text into lines of at most `cols` characters at spaces (a longer word is cut). At most `max_lines`; text
+// that does not fit ends with "..".
+static std::vector<std::string> MenuWrap(const std::string& text, size_t cols, size_t max_lines) {
+  std::vector<std::string> lines;
+  size_t pos = 0;
+  while (pos < text.size() && lines.size() < max_lines) {
+    while (pos < text.size() && text[pos] == ' ') pos++;
+    size_t len = std::min(cols, text.size() - pos);
+    if (pos + len < text.size()) {
+      const size_t sp = text.rfind(' ', pos + len);
+      if (sp != std::string::npos && sp > pos) len = sp - pos;
+    }
+    if (len) lines.push_back(text.substr(pos, len));
+    pos += len;
+  }
+  while (pos < text.size() && text[pos] == ' ') pos++;
+  if (pos < text.size() && !lines.empty()) {
+    std::string& last = lines.back();
+    if (last.size() > cols - 2) last.resize(cols - 2);
+    last += "..";
+  }
+  return lines;
+}
 
 // Draws `text` into px (width w) at (x0, y0) in white, 5x7 glyphs at scale 2.
 static void DrawText(uint32_t* px, uint32_t w, uint32_t x0, uint32_t y0, const char* text) {
@@ -669,15 +744,45 @@ class Deko3dCommandProcessor : public CommandProcessor {
     present_target_ = access((debug_dir + "dk_present_rt").c_str(), F_OK) == 0;
     dump_images_ = access((debug_dir + "dk_dump").c_str(), F_OK) == 0;  // readback dumps stall the GPU: debug only
     dump_tex_ = access((debug_dir + "dk_dump_tex").c_str(), F_OK) == 0;
+    // gh: the per-draw log lines (each shader pair, texture and texture set once) and the sprite diagnostics cost
+    // string keys and set lookups in every draw: only with this marker.
+    draw_diag_ = access((debug_dir + "dk_diag").c_str(), F_OK) == 0;
     {
-      // gh: sprite replacement, sdmc:/switch/gh/mods/sprites/<name>__<id>.png (src/sprite_mod.h)
-      const size_t n = sprite_mod_.Init(debug_dir + "mods/sprites/");
-      sprite_mod_on_ = n > 0;
-      Log("sprite mod: %zu replacement file(s) in %smods/sprites/", n, debug_dir.c_str());
-      // gh: true-colour textures (portraits), sdmc:/switch/gh/mods/textures/<name>__<id>.png, drawn as RGBA
-      const size_t t = texture_mod_.Init(debug_dir + "mods/textures/", true);
-      texture_mod_on_ = t > 0;
-      Log("texture mod: %zu replacement file(s) in %smods/textures/", t, debug_dir.c_str());
+      // gh: data mods (src/sprite_mod.h, docs/SPRITE-REPLACEMENT.md): sdmc:/switch/gh/mods/<id>/ with a mod.toml and
+      // sprites/<name>__<id>.png (8 bit sprites) and/or textures/<name>__<id>.png (true-colour, drawn as RGBA). The
+      // flat folders mods/sprites/ and mods/textures/ of older versions are the mods legacy-sprites and legacy-textures.
+      sprite_mod_.Reset(false);
+      texture_mod_.Reset(true);
+      std::vector<std::string> notes;
+      const std::vector<::gh::ModInfo> mods = ::gh::ScanMods(debug_dir + "mods/", &notes);
+      for (const std::string& t : notes) Log("mods: %s", t.c_str());
+      std::vector<std::string> ids;
+      for (const ::gh::ModInfo& m : mods) {
+        std::string info = m.version.empty() ? "" : "v" + m.version;
+        if (!m.author.empty()) info += (info.empty() ? "by " : " by ") + m.author;
+        const int n = rex_nx_register_mod(m.id.c_str(), m.name.c_str(), m.description.c_str(), info.c_str());
+        if (n < 0) { Log("mods: %s is not loaded (more than 16 mods)", m.id.c_str()); continue; }
+        if (ids.size() <= size_t(n)) ids.resize(n + 1);  // mod 0 is the built-in 4-player mod
+        ids[n] = m.id;
+        const size_t sn = m.sprites_dir.empty() ? 0 : sprite_mod_.AddDir(m.sprites_dir, n);
+        const size_t tn = m.textures_dir.empty() ? 0 : texture_mod_.AddDir(m.textures_dir, n);
+        if (m.name == m.id && !m.legacy) Log("mods: warning: %s has no name in its mod.toml, the id is shown", m.id.c_str());
+        Log("mod %d: %s \"%s\" %s by %s: %s, %zu sprite(s), %zu texture(s)", n, m.id.c_str(), m.name.c_str(),
+            m.version.empty() ? "-" : m.version.c_str(), m.author.empty() ? "-" : m.author.c_str(),
+            rex_nx_mod_on(n) ? "on" : "off", sn, tn);
+      }
+      for (::gh::SpriteMod* store : {&sprite_mod_, &texture_mod_}) {
+        store->SetEnabled([](int mod) { return rex_nx_mod_on(mod) != 0; });
+        const auto& cs = store->conflicts();
+        for (size_t i = 0; i < cs.size() && i < 20; i++)
+          Log("mods: conflict: %s is in %s and in %s; %s wins", cs[i].id.c_str(), ids[cs[i].winner].c_str(),
+              ids[cs[i].loser].c_str(), ids[cs[i].winner].c_str());
+        if (cs.size() > 20) Log("mods: %zu more conflicts", cs.size() - 20);
+      }
+      sprite_mod_on_ = sprite_mod_.file_count() > 0;
+      texture_mod_on_ = texture_mod_.file_count() > 0;
+      Log("mods: %d mod(s) in the menu, %zu sprite file(s), %zu texture file(s) under %smods/", rex_nx_mod_count(), sprite_mod_.file_count(),
+          texture_mod_.file_count(), debug_dir.c_str());
     }
     rex_nx_load_settings();  // gh: rex_nx_overlay (version + fps on screen), settings.txt or the overlay_off marker
     {
@@ -699,7 +804,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   void ShutdownContext() override {
-    if (queue_) dkQueueWaitIdle(queue_);
+    if (queue_ && !gpu_dead_) dkQueueWaitIdle(queue_);
     Log("deko3d backend down: %u swaps, %u draws, %u skipped, %u without shaders, %u clears, %u resolves, %u images (%u MB), %u uploads (%u KB, %u re-uploads), %llu dirty pages",
         swaps_, draws_, skipped_, missing_draws_, clears_, resolves_, image_count_, images_.peak >> 20, uploads_,
         uint32_t(upload_bytes_ >> 10), reuploads_, (unsigned long long)dirty_pages_);
@@ -738,6 +843,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count, IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override {
+    if (gpu_dead_) return true;
+    if (skip_frame_) {
+      if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) return SkippedCopy();
+      perf_skipped_++;
+      return true;
+    }
     SyncDirtyPages();
     const RegisterFile& regs = *register_file_;
     auto mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -757,7 +868,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     if (!PrimitiveOf(prim_type, prim, rects)) { LogOnce("prim", "unsupported primitive type %u", uint32_t(prim_type)); skipped_++; return true; }
     Frame& f = frames_[frame_];
     DkCmdBuf cmd = f.cmdbuf;
-    {
+    Tick perf_tick{perf_draw_};
+    if (draw_diag_) {
       // Each shader pair's first draw, once: the state a new kind of draw comes with.
       char key[48];
       std::snprintf(key, sizeof(key), "pair %016llX %016llX", (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash());
@@ -913,6 +1025,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
 
     // Textures of the pixel shader.
     std::string bound_textures;  // for the draw-type log below
+    const uint64_t perf_tex0 = armGetSystemTick();
     // gh: sprite replacement. A replaced 8 bit sprite is drawn with its palette: the palette binding is the 256 wide
     // RGBA texture of the same draw. Both are swapped for the replacement's index image and its own palette.
     struct PendingTex {
@@ -946,8 +1059,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       pt.fetch_constant = tb.fetch_constant;
       pending_count++;
+      // gh: a mod was switched in the menu since this texture's lookup: look again (another mod may have it).
+      if (pt.tex->mod_kind && pt.tex->mod_epoch != rex_nx_mod_epoch) {
+        pt.tex->mod_epoch = rex_nx_mod_epoch;
+        pt.tex->mod = (pt.tex->mod_kind == 1 ? sprite_mod_ : texture_mod_).Find(pt.info.width + 1, pt.info.height + 1, pt.tex->mod_hash);
+      }
     }
-    if (sprite_mod_on_ && rex_nx_sprite_mods) {
+    if (sprite_mod_on_) {  // a switched-off mod has no tex->mod: the stores' Find skips it
       for (size_t i = 0; i < pending_count; i++) {
         if (pending[i].tex->mod && !pending[i].tex->mod->true_colour && sprite_slot < 0) sprite_slot = int(i);
         else if (pending[i].info.width + 1 == 256 && std::strcmp(pending[i].info.format_info()->name, "k_8_8_8_8") == 0 &&
@@ -989,7 +1107,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
       uint32_t sampler = (fetch.min_filter == xenos::TextureFilter::kLinear ? 32 : 0) |
                          (fetch.mag_filter == xenos::TextureFilter::kLinear ? 16 : 0) |
                          (WrapCodeOf(fetch.clamp_x) << 2) | WrapCodeOf(fetch.clamp_y);
-      {
+      if (draw_diag_) {
         // Each texture's first bind, once: what the game draws with (correlates with the uploads).
         char key[32];
         std::snprintf(key, sizeof(key), "tex %08X", info.memory.base_address);
@@ -1000,11 +1118,14 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
       DkResHandle handle = dkMakeTextureHandle(slot, sampler);
       dkCmdBufBindTextures(cmd, DkStage_Fragment, fc, &handle, 1);
-      char t[48];
-      std::snprintf(t, sizeof(t), " tf%u=%08X(%ux%u)", fc, info.memory.base_address, tex->width, tex->height);
-      bound_textures += t;
+      if (draw_diag_) {
+        char t[48];
+        std::snprintf(t, sizeof(t), " tf%u=%08X(%ux%u)", fc, info.memory.base_address, tex->width, tex->height);
+        bound_textures += t;
+      }
     }
-    {
+    perf_tex_ += armGetSystemTick() - perf_tex0;
+    if (draw_diag_) {
       // Each shader pair's first draw with each texture set, once (the texture bases name the layer).
       char key[160];
       std::snprintf(key, sizeof(key), "pairtex %016llX %016llX%s", (unsigned long long)vs->ucode_data_hash(),
@@ -1017,7 +1138,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // tf1[idx] + c3; where tf3[idx].x > 0 the colour is multiplied by c255.x - tf2(uv * c2 + c1).w (the pencil hatching);
     // the result times c0. One line per character (the tf3 base) and again when its palettes or c0/c3/c255 change (8 per
     // character, 160 in all). Read: c3 (negative = the game darkens), c0, c255.x (1 expected), the mask count, the hatch range.
-    if (ps->ucode_data_hash() == 0xCE23671D5EFA0EDBull && sprdiag_lines_ < 160) {
+    if (draw_diag_ && ps->ucode_data_hash() == 0xCE23671D5EFA0EDBull && sprdiag_lines_ < 160) {
       const PendingTex* t[4] = {};
       for (size_t i = 0; i < pending_count; i++) if (pending[i].fetch_constant < 4) t[pending[i].fetch_constant] = &pending[i];
       if (t[0] && t[1] && t[2] && t[3] && t[1]->info.memory.base_size >= 1024 && t[3]->info.memory.base_size >= 1024) {
@@ -1137,11 +1258,23 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   bool IssueCopy() override {
+    if (gpu_dead_) return true;
+    if (skip_frame_) return SkippedCopy();
     SyncDirtyPages();
     return Resolve();
   }
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width, uint32_t frontbuffer_height) override {
+    Tick perf_tick{perf_swap_};
+    if (gpu_dead_) {  // gh: see BeginFrame: no acquire (it aborts the process on a dead queue), no submit
+      swaps_++;
+      PerfLine();
+      return;
+    }
+    // gh: a skipped frame shows the front buffer of the last drawn frame (the game may swap between two buffers; the
+    // one of this frame was not filled).
+    if (skip_frame_ && last_front_[0]) { frontbuffer_ptr = last_front_[0]; frontbuffer_width = last_front_[1]; frontbuffer_height = last_front_[2]; }
+    else { last_front_[0] = frontbuffer_ptr; last_front_[1] = frontbuffer_width; last_front_[2] = frontbuffer_height; }
     Frame& f = frames_[frame_];
     DkCmdBuf cmd = f.cmdbuf;
     HostImage* front = nullptr;
@@ -1227,10 +1360,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
         for (uint32_t x = 0; x < kMenuW; x++) menu_px_[x] = menu_px_[(kMenuH - 1) * kMenuW + x] = 0xFFFFFFFFu;
         for (uint32_t y = 0; y < kMenuH; y++) menu_px_[y * kMenuW] = menu_px_[y * kMenuW + kMenuW - 1] = 0xFFFFFFFFu;
         const int cur = rex_nx_menu_cursor;
-        char line[32];
+        char line[80];
+        int first = 0;  // the first list line on screen (the mods page scrolls)
+        const int rows = rex_nx_menu_page == 0 ? 11 : 9;
         auto row = [&](int i, const char* name, const char* val) {
+          if (i < first || i >= first + rows) return;
           std::snprintf(line, sizeof(line), "%s%s%s%s", cur == i ? "> " : "  ", name, val ? ": " : "", val ? val : "");
-          DrawText(menu_px_.data(), kMenuW, 12, 26 + 20 * i, line);
+          DrawText(menu_px_.data(), kMenuW, 12, 26 + 20 * (i - first), line);
         };
         auto onoff = [](int v) { return v ? "on" : "off"; };
         if (rex_nx_menu_page == 0) {
@@ -1240,19 +1376,48 @@ class Deko3dCommandProcessor : public CommandProcessor {
           row(2, "sound", onoff(rex_nx_sound));
           row(3, "overlay", onoff(rex_nx_overlay));
           row(4, "hatching", onoff(rex_nx_hatching));
-          row(5, "sprite mods", onoff(rex_nx_sprite_mods));
-          row(6, "cheats", nullptr);
-        } else {
+          row(5, "frame skip", rex_nx_frame_skip ? "30 fps" : "off");
+          row(6, "controls", rex_nx_controls_alt ? "alternative" : "standard");
+          row(7, "start level", rex_nx_level_name(rex_nx_start_level));
+          row(8, "go to level", nullptr);
+          row(9, "cheats", nullptr);
+          row(10, "mods", nullptr);
+        } else if (rex_nx_menu_page == 1) {
           DrawText(menu_px_.data(), kMenuW, 12, 6, "cheats");
           row(0, "invincible", onoff(rex_nx_cheat_invincible));
           row(1, "magic", onoff(rex_nx_cheat_mp));
           row(2, "continues", onoff(rex_nx_cheat_continues));
           row(3, "attributes", onoff(rex_nx_cheat_attributes));
-          row(4, "start level", rex_nx_level_name(rex_nx_start_level));
-          row(5, "apply", nullptr);
-          row(6, "back", nullptr);
+          row(4, "back", nullptr);
+        } else {
+          // The mods page: one line per mod (the list scrolls), then the description of the mod under the cursor.
+          const int mods = rex_nx_mod_count(), total = mods + 1;
+          first = std::max(0, std::min(cur - 4, total - 9));
+          DrawText(menu_px_.data(), kMenuW, 12, 6, mods ? (first + 9 < total ? "mods (more below)" : "mods") : "mods: none found");
+          const size_t name_cols = kMenuCols - 2 - 5;  // "> " before, ": off" after
+          for (int i = 0; i < mods; i++) {
+            std::string name = MenuPlain(rex_nx_mod_name(i));
+            if (name.size() > name_cols) {
+              if (i == cur) {
+                // The line under the cursor scrolls: a step every 0.25 s, with a pause at both ends.
+                const size_t over = name.size() - name_cols, step = size_t(armTicksToNs(armGetSystemTick()) / 250000000ull) % (over + 8);
+                name = name.substr(step < 4 ? 0 : std::min(step - 4, over), name_cols);
+              } else {
+                name = name.substr(0, name_cols - 2) + "..";
+              }
+            }
+            row(i, name.c_str(), onoff(rex_nx_mod_on(i)));
+          }
+          row(mods, "back", nullptr);
+          for (uint32_t x = 8; x < kMenuW - 8; x++) menu_px_[210 * kMenuW + x] = 0xFFFFFFFFu;
+          if (cur < mods) {
+            const std::vector<std::string> text = MenuWrap(MenuPlain(rex_nx_mod_description(cur)), kMenuCols - 1, 2);
+            for (size_t i = 0; i < text.size(); i++) DrawText(menu_px_.data(), kMenuW, 12, 216 + 18 * uint32_t(i), text[i].c_str());
+            const std::vector<std::string> info = MenuWrap(MenuPlain(rex_nx_mod_info(cur)), kMenuCols - 1, 1);
+            if (!info.empty()) DrawText(menu_px_.data(), kMenuW, 12, 252, info[0].c_str());
+          }
         }
-        DrawText(menu_px_.data(), kMenuW, 12, 170, "a ok   b back");
+        DrawText(menu_px_.data(), kMenuW, 12, 274, "a ok   b back");
         const uint32_t bytes = kMenuW * kMenuH * 4;
         const uint32_t off = f.staging.Alloc(bytes, 0x100);
         if (off != UINT32_MAX) {
@@ -1269,7 +1434,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
       }
     }
     if (swaps_ < 5) Log("swap #%u: acquiring a swapchain image", swaps_ + 1);
+    const uint64_t perf_acq0 = armGetSystemTick();
     int slot = dkQueueAcquireImage(queue_, swapchain_);
+    perf_acquire_ += armGetSystemTick() - perf_acq0;
     if (swaps_ < 5) Log("swap #%u: slot %d", swaps_ + 1, slot);
     HostImage* target = swap_images_[slot];
     dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
@@ -1338,6 +1505,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     }
     dkCmdBufBarrier(cmd, DkBarrier_Full, 0);
     DkCmdList list = dkCmdBufFinishList(cmd);
+    std::snprintf(frame_note_[frame_], sizeof(frame_note_[0]), "swap %u: %u draws, %u clears, %u resolves, %u re-uploads, %u resize copies, "
+                  "staging %u KB, data %u KB, menu %d, skip %d", swaps_ + 1, frame_draws_, frame_clears_, frame_resolves_, frame_reuploads_,
+                  frame_resize_copies_, f.staging.used >> 10, f.data.used >> 10, int(rex_nx_menu_open), int(skip_frame_));
     dkQueueSubmitCommands(queue_, list);
     dkQueueSignalFence(queue_, &f.fence, false);
     f.fenced = true;
@@ -1383,23 +1553,100 @@ class Deko3dCommandProcessor : public CommandProcessor {
           frame_clears_, frame_resolves_, frame_skipped_, frame_missing_, frame_reuploads_, (unsigned long long)(dirty_pages_ - dirty_pages_at_swap_),
           f.data.used >> 10, f.staging.used >> 10, image_count_, images_.used >> 20);
     }
+    PerfLine();
+    // gh: frame skip (the menu, fps_cap=30). The game runs its 60 frames a second; every second one is not drawn: its
+    // draws, clears and copies are dropped whole and this swap shows the last image again, on time. The host images
+    // (render targets, resolve destinations) keep the last drawn frame, the next frame draws everything again, and a
+    // texture the game changed meanwhile is uploaded at its next bind (the dirty pages stay marked). The guest reads
+    // nothing back from the renderer, so it cannot see the difference.
+    // ponytail: parity only. A picture the game renders ONCE into a texture on a skipped frame (a pause background)
+    // is lost; SkippedCopy counts copies to a destination that has no image ("new" in the perf line). If that shows,
+    // draw such a frame late (keep its packets) or never skip the frame after a change of the copy count.
+    skip_frame_ = rex_nx_frame_skip && (swaps_ & 1);
     dirty_pages_at_swap_ = dirty_pages_;
-    frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_missing_ = frame_reuploads_ = 0;
+    frame_draws_ = frame_clears_ = frame_resolves_ = frame_skipped_ = frame_missing_ = frame_reuploads_ = frame_resize_copies_ = 0;
     frame_ = (frame_ + 1) % kFrames;
     BeginFrame();
   }
 
  private:
+  bool SkippedCopy() {
+    perf_skipped_++;
+    draw_util::ResolveInfo info;  // the same lookup as Resolve(): its destination is the image key
+    if (draw_util::GetResolveInfo(*register_file_, *memory_, 1, 1, false, false, info) && !info.IsCopyingDepth() &&
+        !guest_images_.count(info.copy_dest_base)) perf_skip_new_++;
+    return true;
+  }
+
+  // gh: one line a second: where the command processor's time goes, per frame. "draw" is IssueDraw without clears and
+  // copies ("tex" inside it: texture checks, hashes, uploads, binds), "copy" the resolves, "swap" the whole IssueSwap
+  // ("acquire" and "fence" inside it wait for the display and for the GPU). "gpu wait" is the time in WAIT_REG_MEM: the
+  // command processor waits for a value the guest (or its interrupt callback) writes. "guest poll" is the share of the
+  // second the game's thread spent in its own GPU poll (sub_825D6A68): it waits for the command processor there.
+  void PerfLine() {
+    const uint64_t now = armGetSystemTick();
+    perf_frames_++;
+    if (!perf_t0_) perf_t0_ = now;
+    if (now - perf_t0_ < armGetSystemTickFreq()) return;
+    const double n = perf_frames_, ms = 1e-6 / n;
+    const double sec = double(armTicksToNs(now - perf_t0_)) * 1e-9;
+    uint64_t kind[4];
+    double wait = 0;
+    for (int i = 0; i < 4; i++) {
+      const uint64_t v = rex_nx_wait_kind_ns[i];
+      kind[i] = v - perf_kind_[i];
+      perf_kind_[i] = v;
+      wait += double(kind[i]);
+    }
+    const uint64_t poll = rex_nx_guest_poll_ticks, hooks = rex_nx_hook_calls;
+    std::printf("[dk] perf: %.1f fps | frame ms: draw %.2f (tex %.2f, %u draws), clear %.2f (%u), copy %.2f (%u), swap %.2f "
+                "(acquire %.2f, fence %.2f) | uploads %u, %u KB | gpu wait %.2f ms: reg %.2f, 1002 %.2f, 1006 %.2f, other %.2f"
+                " | guest poll %.0f%% | hooks %llu/s | skip %s: %u packets/s, %u new, upload %.2f (detile %.2f) ms\n",
+                n / sec, double(armTicksToNs(perf_draw_)) * ms, double(armTicksToNs(perf_tex_)) * ms, uint32_t((draws_ - perf_draws_) / n),
+                double(armTicksToNs(perf_clear_)) * ms, uint32_t((clears_ - perf_clears_) / n), double(armTicksToNs(perf_copy_)) * ms,
+                uint32_t((resolves_ - perf_resolves_) / n), double(armTicksToNs(perf_swap_)) * ms, double(armTicksToNs(perf_acquire_)) * ms,
+                double(armTicksToNs(perf_fence_)) * ms, uploads_ - perf_uploads_, uint32_t((upload_bytes_ - perf_upload_bytes_) >> 10),
+                wait * ms, double(kind[0]) * ms, double(kind[1]) * ms, double(kind[2]) * ms, double(kind[3]) * ms,
+                double(armTicksToNs(poll - perf_poll_)) * 1e-7 / sec, (unsigned long long)(double(hooks - perf_hooks_) / sec),
+                rex_nx_frame_skip ? "on" : "off", uint32_t(perf_skipped_ / sec), perf_skip_new_, double(armTicksToNs(perf_upload_)) * ms,
+                double(armTicksToNs(perf_detile_)) * ms);
+    perf_skipped_ = perf_skip_new_ = 0;
+    perf_upload_ = perf_detile_ = 0;
+    perf_draw_ = perf_tex_ = perf_clear_ = perf_copy_ = perf_swap_ = perf_acquire_ = perf_fence_ = 0;
+    perf_draws_ = draws_; perf_clears_ = clears_; perf_resolves_ = resolves_; perf_uploads_ = uploads_;
+    perf_upload_bytes_ = upload_bytes_; perf_poll_ = poll; perf_hooks_ = hooks;
+    perf_frames_ = 0;
+    perf_t0_ = now;
+  }
+
   // ----- frames ---------------------------------------------------------------------------------
   void BeginFrame() {
+    if (gpu_dead_) return;
     Frame& f = frames_[frame_];
     if (f.fenced) {
       if (swaps_ < 6) Log("frame %u: waiting for its fence", frame_);
+      const uint64_t perf_f0 = armGetSystemTick();
       DkResult r = dkFenceWait(&f.fence, 2000000000ll);  // 2 s: a hang is logged, not silent
+      perf_fence_ += armGetSystemTick() - perf_f0;
       if (r != DkResult_Success) {
         Log("frame %u: fence wait result %d (GPU hang?), swap %u, %u images, %zu free, %zu pending", frame_, int(r), swaps_, image_count_,
             free_images_.size(), pending_free_[0].size() + pending_free_[1].size());
         DumpImageEvents();
+        // gh: the frame that waits is this slot's last one; the other slot's ran before or after it.
+        for (uint32_t i = 0; i < kFrames; i++) Log("frame %u was %s", i, frame_note_[i]);
+        // A hung channel never comes back, and the next dkQueueAcquireImage aborts the process (0.115: crash report
+        // 2359-0001 from dk::detail::RaiseError). Stop all GPU work: the game and the sound run on, the picture stays.
+        // The second timeout in a row decides too, so one slow frame (sleep, HOME) does not end the picture.
+        const bool queue_error = dkQueueIsInErrorState(queue_);
+        if (queue_error || ++fence_timeouts_ >= 2) {
+          gpu_dead_ = true;
+          Log("GPU is hung (queue error state %d): drawing stopped, the picture stays frozen. Close the game from HOME.", int(queue_error));
+          std::fflush(stdout);
+          return;
+        }
+        std::fflush(stdout);
+      } else {
+        fence_timeouts_ = 0;
       }
       free_images_.insert(free_images_.end(), pending_free_[frame_].begin(), pending_free_[frame_].end());
       pending_free_[frame_].clear();
@@ -1598,7 +1845,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
         fresh->guest_base = base;
         Log("image at %08X recreated: format %u -> %u, %ux%u -> %ux%u", base, uint32_t(img->format), uint32_t(format), img->width,
             img->height, fresh->width, fresh->height);
-        NoteImage("frame %u recreated %08X fmt %u->%u %ux%u->%ux%u", frame_, base, uint32_t(img->format), uint32_t(format), img->width,
+        NoteImage("swap %u frame %u recreated %08X fmt %u->%u %ux%u->%ux%u", swaps_ + 1, frame_, base, uint32_t(img->format), uint32_t(format), img->width,
                   img->height, fresh->width, fresh->height);
         it->second = fresh;
         RecycleImage(img);
@@ -1620,16 +1867,23 @@ class Deko3dCommandProcessor : public CommandProcessor {
       dkImageViewDefaults(&sv, &img->image);
       dkImageViewDefaults(&dv, &resized->image);
       DkImageRect sr{0, 0, 0, cw, ch, 1}, dr{0, 0, 0, cw, ch, 1};
-      dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
-      dkCmdBufCopyImage(f.cmdbuf, &sv, &sr, &dv, &dr, 0);
-      dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
-      resized->from_resolve = img->from_resolve;
-      resized->content_serial = img->content_serial;
-      resized->checked_serial = img->checked_serial;
+      // gh: only a resolve destination keeps its picture. A texture of another size at the same address is another
+      // texture: the old bytes are wrong for it, the upload fills it (content_serial 0). Both GPU hangs (0.85 level 3,
+      // 0.115 title) were in the frame of such a texture resize copy (576x192 -> 64x160 k_8, 1280x720 -> 672x720 DXT1);
+      // 0.95 did one (96x64 -> 64x64) without a hang, so the copy is a suspect, not a proven cause.
+      if (img->from_resolve) {
+        dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+        dkCmdBufCopyImage(f.cmdbuf, &sv, &sr, &dv, &dr, 0);
+        dkCmdBufBarrier(f.cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image);
+        frame_resize_copies_++;
+        resized->from_resolve = true;
+        resized->content_serial = img->content_serial;
+        resized->checked_serial = img->checked_serial;
+      }
       resized->guest_base = base;
       Log("image at %08X resized %ux%u -> %ux%u", base, img->width, img->height, width, height);
-      NoteImage("frame %u resized %08X %ux%u->%ux%u (%s)", frame_, base, img->width, img->height, width, height,
-                resized == img ? "same" : "new object");
+      NoteImage("swap %u frame %u resized %08X %ux%u->%ux%u (%s)", swaps_ + 1, frame_, base, img->width, img->height, width, height,
+                img->from_resolve ? "copied" : "texture, no copy");
       it->second = resized;
       RecycleImage(img);  // gh: its pool memory is reused by the next request of its size
       return resized;
@@ -1829,6 +2083,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, xenos::Endian endian) {
+    Tick perf_tick{perf_upload_};
     const FormatInfo* fi = info.format_info();
     const uint32_t width = info.width + 1, height = info.height + 1;  // TextureInfo keeps size minus one
     uint32_t bw = (width + fi->block_width - 1) / fi->block_width;
@@ -1841,12 +2096,19 @@ class Deko3dCommandProcessor : public CommandProcessor {
     const uint8_t* src = memory_->TranslatePhysical(info.memory.base_address);
     const uint32_t stride = GuestPitchBlocks(info.pitch, fi->block_width);  // gh: pitch is in texels, the tiles are 32 BLOCKS wide: round up (DXT 608 -> 160, not 152)
     DumpRaw(fi, info, width, height, stride, src, endian);
-    if (info.is_tiled) gh_tex::DetileBlocks(dst, src, bw, bh, stride, bpb, uint32_t(endian));
-    else gh_tex::CopyLinearBlocks(dst, src, bw, bh, stride, bpb, uint32_t(endian));
+    {
+      Tick detile_tick{perf_detile_};
+      if (info.is_tiled) gh_tex::DetileBlocks(dst, src, bw, bh, stride, bpb, uint32_t(endian));
+      else gh_tex::CopyLinearBlocks(dst, src, bw, bh, stride, bpb, uint32_t(endian));
+    }
     img.mod = nullptr;
+    img.mod_kind = 0;
+    img.mod_epoch = rex_nx_mod_epoch;
     if (sprite_mod_on_ && std::strcmp(fi->name, "k_8") == 0) {
       // gh: 8 bit textures are the sprite frames (indices; the palette is a second texture). Identify by content.
       const uint64_t hash = ::gh::SpriteHash(dst, size_t(width) * height);
+      img.mod_kind = 1;
+      img.mod_hash = hash;
       img.mod = sprite_mod_.Find(width, height, hash);
       if (img.mod) {
         const std::string id = ::gh::SpriteId(width, height, hash);
@@ -1868,6 +2130,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
       const std::string id = ::gh::SpriteId(width, height, hash);
       if (dump_tex_) LogOnce(("textureid " + id).c_str(), "texture id %s (%s)", id.c_str(), fi->name);
       if (texture_lookup) {
+        img.mod_kind = 2;
+        img.mod_hash = hash;
         img.mod = texture_mod_.Find(width, height, hash);
         const std::string key = "texmod " + id;  // one line per id: replaced, load error or no file
         if (img.mod) LogOnce(key.c_str(), "texture mod: %s replaced (%ux%u -> %ux%u)", id.c_str(), width, height, img.mod->w, img.mod->h);
@@ -1988,6 +2252,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   bool ClearDraw(uint32_t vertex_count, xenos::EdramMode mode) {
+    Tick perf_tick{perf_clear_};
     const RegisterFile& regs = *register_file_;
     Frame& f = frames_[frame_];
     DkCmdBuf cmd = f.cmdbuf;
@@ -2053,6 +2318,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
   }
 
   bool Resolve() {
+    Tick perf_tick{perf_copy_};
     const RegisterFile& regs = *register_file_;
     Frame& f = frames_[frame_];
     DkCmdBuf cmd = f.cmdbuf;
@@ -2164,7 +2430,6 @@ class Deko3dCommandProcessor : public CommandProcessor {
     std::vprintf(fmt, ap);
     std::printf("\n");
     va_end(ap);
-    std::fflush(stdout);
   }
 
   DkDevice device_ = nullptr;
@@ -2181,6 +2446,16 @@ class Deko3dCommandProcessor : public CommandProcessor {
   bool present_target_ = false;
   bool dump_images_ = false;
   bool dump_tex_ = false;  // gh: marker dk_dump_tex
+  bool draw_diag_ = false;  // gh: marker dk_diag
+  bool skip_frame_ = false;  // gh: frame skip: this guest frame is not drawn
+  bool gpu_dead_ = false;    // gh: a fence never signalled (BeginFrame): no GPU work any more
+  uint32_t fence_timeouts_ = 0, frame_resize_copies_ = 0;
+  char frame_note_[kFrames][192] = {};  // gh: what each frame slot last submitted, for the log of a hang
+  uint32_t perf_skipped_ = 0, perf_skip_new_ = 0, last_front_[3] = {};
+  uint64_t perf_upload_ = 0, perf_detile_ = 0;
+  uint64_t perf_draw_ = 0, perf_tex_ = 0, perf_clear_ = 0, perf_copy_ = 0, perf_swap_ = 0, perf_acquire_ = 0, perf_fence_ = 0;
+  uint64_t perf_t0_ = 0, perf_kind_[4] = {}, perf_poll_ = 0, perf_hooks_ = 0, perf_upload_bytes_ = 0;
+  uint32_t perf_frames_ = 0, perf_draws_ = 0, perf_clears_ = 0, perf_resolves_ = 0, perf_uploads_ = 0;
   ::gh::SpriteMod sprite_mod_;  // gh: replacement sprites from the mod folder
   bool sprite_mod_on_ = false;
   HostImage* no_hatch_ = nullptr;

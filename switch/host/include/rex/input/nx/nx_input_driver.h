@@ -32,9 +32,9 @@ class NXInputDriver final : public InputDriver {
   };
   void LoadSchedule();
 
-  PadState pad_{};
-  uint32_t packet_number_ = 0;
-  uint64_t last_buttons_ = 0;
+  PadState pads_[5]{};  // handheld, No1..No4
+  uint32_t packet_number_[5]{};
+  uint64_t last_buttons_[5]{};
   std::vector<Scheduled> schedule_;
   uint64_t t0_tick_ = 0;
   bool schedule_loaded_ = false;

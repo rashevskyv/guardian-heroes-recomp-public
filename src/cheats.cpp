@@ -41,8 +41,24 @@ extern "C" {
 extern volatile int rex_nx_cheat_invincible, rex_nx_cheat_mp, rex_nx_cheat_continues, rex_nx_cheat_attributes;
 extern volatile int rex_nx_start_level, rex_nx_apply_level;
 void rex_nx_load_settings(void);
+extern volatile uint64_t rex_nx_guest_poll_ticks;
+}
+#include <switch.h>
+// The [dk] perf line: sub_825D6A68 is the game's own GPU poll (one step of its spin loop, 6 callers). The time in it
+// is the time the game's thread waits for the command processor.
+DECLARE_REX_FUNC(sub_825D6A68);
+REX_HOOK_RAW(sub_825D6A68) {
+  const uint64_t t0 = armGetSystemTick();
+  __imp__sub_825D6A68(ctx, base);
+  rex_nx_guest_poll_ticks = rex_nx_guest_poll_ticks + (armGetSystemTick() - t0);
 }
 #endif
+
+// 4-player story mode (story4p.cpp) shares these hooks; it calls the originals.
+extern "C" REX_FUNC(Story4pHook_sub_8248A1F0);
+extern "C" REX_FUNC(Story4pHook_sub_824DEA90);
+extern "C" REX_FUNC(Story4pHook_sub_824E4308);
+extern "C" REX_FUNC(Story4pHook_sub_82468FA8);
 
 namespace {
 constexpr uint32_t kGame = 0x829CBFE8;  // game state (what sub_82495B30 returns); +942 continues, +1672 player slots
@@ -230,6 +246,17 @@ constexpr uint32_t kMode = 0x829B2184;
 // on entry, clears +15, clears +964 bit 2 for stages after 1-3, resets the story stats (sub_82496DF8) and starts
 // the story scene.
 constexpr uint32_t kSelect = 0x82913D0C;
+// gh: the start level applies once per visit of the title. 0.111 wrote it at every story entry (sub_82500128 also runs
+// between two stages), so the chosen stage started again and again. g_level_armed: the next story entry may still
+// apply start_level (Continue from the title); a new game, a Continue or a stage load clears it, the title sets it.
+// g_jump_level: the level of "go to level" for the new-game hook (it must win over start_level).
+bool g_level_armed = true;
+int g_jump_level = 0;
+void ConsumeLevel(const char* why) {
+  if (!g_level_armed) return;
+  g_level_armed = false;
+  std::printf("[gh] start level consumed (%s): the story goes on to the next stage\n", why);
+}
 
 void SelectStage(uint8_t* base, int level) {
   REX_STORE_U32(kSelect + 16, static_cast<uint32_t>(level - 1));
@@ -252,6 +279,7 @@ void GhApplyJump(const PPCContext& ctx, uint8_t* base) {
   call.r3.u32 = kMode + 12;
   sub_8242AEA0(call, base);
   SelectStage(base, level);
+  g_jump_level = level;
   REX_STORE_U16(kMode + 2, 4);
   REX_STORE_U8(kMode + 7, 1);
   std::printf("[gh] apply: scene destroyed, stage select %d, requested mode state 4\n", level - 1);
@@ -265,22 +293,23 @@ REX_HOOK_RAW(sub_8248A1F0) {
 #if defined(__SWITCH__)
   static uint16_t last_state = 0xFFFF;
   GhApplyJump(ctx, base);
-  __imp__sub_8248A1F0(ctx, base);
+  Story4pHook_sub_8248A1F0(ctx, base);  // story4p.cpp, which calls the original
   const uint16_t now = REX_LOAD_U16(kMode);
   if (now != last_state) {
+    if (now == 3 && !g_level_armed) { g_level_armed = true; std::printf("[gh] title: start level armed again\n"); }
     std::printf("[gh] mode state %u -> %u (stage byte %u)\n", last_state, now, REX_LOAD_U8(kGame + 0x3AF));
     std::fflush(stdout);
     last_state = now;
   }
 #else
-  __imp__sub_8248A1F0(ctx, base);
+  Story4pHook_sub_8248A1F0(ctx, base);  // story4p.cpp, which calls the original
 #endif
 }
 
 
 REX_HOOK_RAW(sub_824DEA90) {
   ApplyCheats(ctx, base);
-  __imp__sub_824DEA90(ctx, base);
+  Story4pHook_sub_824DEA90(ctx, base);  // story4p.cpp, which calls the original
 }
 
 REX_HOOK_RAW(sub_82478988) {
@@ -299,7 +328,7 @@ REX_HOOK_RAW(sub_824411C0) {
 
 REX_HOOK_RAW(sub_824E4308) {
   RefillContinues(base);
-  __imp__sub_824E4308(ctx, base);
+  Story4pHook_sub_824E4308(ctx, base);  // story4p.cpp, which calls the original
   RefillContinues(base);
 }
 
@@ -309,7 +338,11 @@ REX_HOOK_RAW(sub_824E4308) {
     BeforeAttributeRebuild(ctx, base, ctx.r3.u32);       \
     __imp__##name(ctx, base);                            \
   }
-ATTRIBUTE_REBUILD(sub_82468FA8)
+// sub_82468FA8 is also hooked by story4p.cpp: call its handler, which calls the original.
+REX_HOOK_RAW(sub_82468FA8) {
+  BeforeAttributeRebuild(ctx, base, ctx.r3.u32);
+  Story4pHook_sub_82468FA8(ctx, base);
+}
 ATTRIBUTE_REBUILD(sub_824418C8)
 ATTRIBUTE_REBUILD(sub_824429A8)
 ATTRIBUTE_REBUILD(sub_82441248)
@@ -326,13 +359,15 @@ ATTRIBUTE_REBUILD(sub_82441248)
 void GhStartLevel() {
   rex_nx_load_settings();
   auto* base = rex::system::kernel_memory()->virtual_membase();
-  const int level = rex_nx_start_level;
+  const int level = g_jump_level ? g_jump_level : rex_nx_start_level;
+  g_jump_level = 0;
   const uint8_t before = REX_LOAD_U8(kGame + 0x3AF);
   if (level >= 1 && level <= 40) {
     REX_STORE_U8(kGame + 0x3AF, static_cast<uint8_t>(level - 1));
     SelectStage(base, level);  // state 8 then runs the game's own stage-select setup
   }
-  std::printf("[gh] new game: stage byte %u -> %u (start_level %d)\n", before, REX_LOAD_U8(kGame + 0x3AF), level);
+  std::printf("[gh] new game: stage byte %u -> %u (start level %d)\n", before, REX_LOAD_U8(kGame + 0x3AF), level);
+  ConsumeLevel("new game");
   std::fflush(stdout);
 }
 #else
@@ -345,6 +380,9 @@ REX_HOOK_RAW(sub_824E6730) {
               static_cast<int>(ctx.r3.s32), REX_LOAD_U8(kGame + 0x3AF), REX_LOAD_U32(kGame + 964),
               static_cast<uint32_t>(ctx.lr));
   std::fflush(stdout);
+#if defined(__SWITCH__)
+  ConsumeLevel("stage load");
+#endif
   __imp__sub_824E6730(ctx, base);
 }
 
@@ -360,9 +398,10 @@ void OverrideStoryEntry(uint8_t* base, const char* where) {
   const int level = rex_nx_start_level;
   const uint8_t before = REX_LOAD_U8(kGame + 0x3AF);
   static uint8_t last_logged = 0xFF;
-  if (level >= 1 && level <= 40 && before != level - 1) {
+  if (g_level_armed && level >= 1 && level <= 40 && before != level - 1) {
     REX_STORE_U8(kGame + 0x3AF, static_cast<uint8_t>(level - 1));
     std::printf("[gh] continue: stage %u -> %u (start_level %d, in %s)\n", before, level - 1, level, where);
+    ConsumeLevel("continue");
     std::fflush(stdout);
   } else if (before != last_logged) {
     std::printf("[gh] story entry in %s: stage byte %u, start_level %d (unchanged)\n", where, before, level);

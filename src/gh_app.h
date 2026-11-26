@@ -9,6 +9,7 @@
 REXCVAR_DECLARE(uint32_t, license_mask);
 REXCVAR_DECLARE(std::string, gpu_plugin);
 REXCVAR_DECLARE(bool, mnk_mode);
+void Story4pCreateOverlay(rex::ui::ImGuiDrawer* drawer);  // story4p.cpp: "Player N is waiting"
 #endif
 
 #if defined(__SWITCH__)
@@ -44,6 +45,7 @@ class GhApp : public rex::ReXApp {
   // The window deletes itself with the drawer; it opens on Back/Select (held) or F1.
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     new GhSettings(drawer, [this] { return runtime(); }, [this] { return window(); }, config_path_);
+    Story4pCreateOverlay(drawer);
   }
 
  private:

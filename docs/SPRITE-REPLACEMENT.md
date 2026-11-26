@@ -74,15 +74,37 @@ Skip this step for a sprite that has one palette only, or if you accept the cost
 
 ## Step 4: put the files on the Switch
 
-Copy your PNG files to `sdmc:/switch/gh/mods/sprites/`. The folder is flat. The game lists it once at start.
-Add or remove a file, then restart the game.
+Make a mod folder and copy it to `sdmc:/switch/gh/mods/`:
+
+```
+python3 -I tools/make_sprite_mod.py <your PNG folder> out --id hd-heroes --name "HD Heroes"     --description "Upscaled hero sprites" --author "your name" --version 1.0
+```
+
+It writes `out/hd-heroes/mod.toml` and `out/hd-heroes/sprites/*.png`. Copy `out/hd-heroes/` to `sdmc:/switch/gh/mods/hd-heroes/`.
+
+| `mod.toml` key | Meaning |
+| --- | --- |
+| `id` | The same as the folder name. Letters, digits, `_` and `-`, at most 31 characters. |
+| `name` | The name in the menu. Without it the id is shown and the log has a warning. |
+| `description` | One or two short sentences. The menu shows them under the mod list (two lines of 31 characters, the rest is cut). |
+| `version`, `author` | Shown in the menu as `v<version> by <author>`, and in the log. |
+| `license` | Information. |
+| `kind` | `sprites` or `textures`. Information only: the game reads the `sprites/` and the `textures/` subfolder when they exist. |
+| `order` | Optional number, default 0. A lower number wins when two mods hold the same picture. Equal numbers: the id that comes first in the alphabet wins. |
+
+- The game lists the mods once at start. Add or remove a file, then restart the game.
+- Each mod has a switch in the menu (+ and − together, line `mods`) and a key `mod.<id>=0|1` in `sdmc:/switch/gh/settings.txt`. A new mod starts on. The switches work at once.
+- The old way still works: PNG files directly in `sdmc:/switch/gh/mods/sprites/` (and `mods/textures/`). They show up as the mods "legacy sprites" (`legacy-sprites`) and "legacy textures" (`legacy-textures`). They lose every conflict with a real mod. The menu font has small Latin letters, digits and a few signs; another character shows as `?`.
+- At most 16 mods are loaded.
 
 ## Step 5: test
 
 1. Eden first: `powershell -File switch/eden-deko3d.ps1 -Seconds 60 -Keys "15:A,25:A,33:A,41:A,49:A,57:A,65:A"`.
    The key list reaches the Story intro scene (the tavern) in about 40 s. The Eden SD card is `E:\Switch\Eden-gh\user\sdmc\switch\gh\`.
 2. Read `gh_log.txt`:
-   - `sprite mod: N replacement file(s) in .../mods/sprites/`: the folder was found and N files are listed.
+   - `mod N: <id> "<name>" <version> by <author>: on, S sprite(s), T texture(s)`: the mod was found, with S and T files.
+   - `mods: <folder>: ..., skipped`: the folder is not a mod (no `mod.toml`, a wrong id, no `sprites/` or `textures/`).
+   - `mods: conflict: <picture id> is in A and in B; A wins`: two mods hold the same picture.
    - `sprite mod: <id> replaced (WxH -> WxH)`: that frame was drawn with your file.
    - `sprite mod: <error>`: a file did not load (bad PNG, interlaced, truncated).
 3. To see which ids a scene uses, create the empty file `sdmc:/switch/gh/dk_dump_tex`. The log then prints `sprite id <id>` for every 8 bit texture.
@@ -112,13 +134,13 @@ Build 0.80 or later. The character select portraits and other RGBA8 or DXT textu
    ```
    It writes `mods/textures/<file>_t<entry>__<id>.png` for every texture entry. `.mrgc` files also work.
 2. Repaint or upscale. Any size works. Keep the part after `__`.
-3. Copy the PNGs to `sdmc:/switch/gh/mods/textures/` (flat folder, listed once at start).
+3. Copy the PNGs to the `textures/` subfolder of your mod (`sdmc:/switch/gh/mods/<id>/textures/`, see step 4; `tools/make_sprite_mod.py --kind textures` makes it). The flat folder `sdmc:/switch/gh/mods/textures/` still works.
 
 - The id is `<width>x<height>_<hash>`, like the sprite id. Width and height are the game texture size. The hash covers the texture bytes as the renderer stages them.
 - The PNG pixels go to the GPU unchanged: no palette, no colour reduction. The exported PNG has the alpha convention of the game file. If the original edges look dark in the export, the game data is premultiplied: keep your picture premultiplied too.
 - The largest replacement is 24 MB of RGBA (about 2500x2500). A larger one is not used.
 - Log lines in `gh_log.txt`:
-  - `texture mod: N replacement file(s) in .../mods/textures/`: the folder was found.
+  - `mod N: <id> ... T texture(s)`: the mod was found with T texture files.
   - `texture mod: <id> replaced (WxH -> WxH)`: the texture was drawn with your file.
   - `texture mod: no file for <id> (<format> at <address>)`: a file has this size, but no file has this id. If the game uses another id than the export, rename your file to this id.
   - `texture mod: <error>`: a file did not load.

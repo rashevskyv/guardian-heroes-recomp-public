@@ -17,6 +17,8 @@
 #include <rex/ui/window_nx.h>
 #include <rex/ui/windowed_app.h>
 
+extern "C" void userAppExit(void);  // switch_nx.cpp: stops our threads, puts the clocks back, writes the log
+
 namespace {
 // Step marks in sdmc:/switch/gh/gh_log.txt (stdout), flushed at once: a crash names the step.
 void step(const char* what) {
@@ -109,8 +111,14 @@ int main(int argc, char* argv[]) {
       step("OnInitialize failed");
       result = EXIT_FAILURE;
     }
-    app->InvokeOnDestroy();
-    step("app destroyed");
+    // gh: no teardown. 0.111 destroyed the runtime here while the guest threads, the command processor and the log
+    // thread still ran: a data abort in the log flush and a User Break crash report on Exit (2026-11-26). Not libnx's
+    // exit either: it closes hid, time and fs under the threads that still use them. userAppExit stops our threads,
+    // puts the clocks back and writes the log; then the kernel stops every thread at once, as when HOME closes a game.
+    step("leaving without teardown");
+    std::fflush(nullptr);  // every open file, the game's included
+    userAppExit();
+    svcExitProcess();
   }
   return result;
 }

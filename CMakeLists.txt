@@ -62,6 +62,7 @@ set(GH_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     src/cheats.cpp
+    src/story4p.cpp
 )
 if(NOT NINTENDO_SWITCH)
     # The ImGui settings window (Back/Select or F1); the Switch has no ImGui overlay under deko3d.
